@@ -8,7 +8,7 @@ Make sure you have Docker installed.
 
 
 1. Create a `.vibe-sandbox` directory in your home directory with owner `1000`:
-```bash
+```plain
 mkdir -p ~/.vibe-sandbox && sudo chown 1000 ~/.vibe-sandbox && sudo chmod 700 ~/.vibe-sandbox
 ```
 
@@ -17,7 +17,7 @@ workstation and use your sandbox seamlessly on this machines. Additionally, you 
 outside of the sandbox.
 
 2. Link `vibe-sandbox` in your path:
-```
+```plain
 ln -s "$PWD/vibe-sandbox" ~/.local/bin/vibe-sandbox
 ```
 
@@ -25,3 +25,6 @@ ln -s "$PWD/vibe-sandbox" ~/.local/bin/vibe-sandbox
 
 **Start the sandbox in the directory you want to work**:
 
+```plain
+vibe-sandbox
+```
