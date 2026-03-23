@@ -16,4 +16,5 @@ docker run \
   -v "${HOME}/.vibe-sandbox:/home/vibe-user/.vibe" \
   -v /etc/localtime:/etc/localtime:ro \
   -v /etc/timezone:/etc/timezone:ro \
-  vibe-sandbox:latest
+  vibe-sandbox:latest \
+  "$@"

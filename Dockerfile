@@ -49,4 +49,4 @@ RUN echo 'export PATH="/home/vibe-user/.local/bin:$PATH"' >> ~/.bashrc \
     && echo 'export PS1="vibe-sandbox:\w$ "' >> ~/.bashrc \
     && echo 'echo "vibe available at: $(which vibe 2>/dev/null || echo NOT FOUND)"' >> ~/.bashrc
 
-CMD ["/bin/bash", "-c", "/home/vibe-user/.local/bin/vibe"]
+ENTRYPOINT ["/home/vibe-user/.local/bin/vibe"]
