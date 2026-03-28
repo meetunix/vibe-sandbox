@@ -7,6 +7,9 @@
 # cache-buster in the Dockerfile, ensuring the image rebuilds when mistral-vibe
 # is upgraded
 
+# Get the directory where this build.sh build.sh script is located
+REPO_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
 # Configuration
 REPO="mistralai/mistral-vibe"
 COMMIT_HASH_FILE=".mistral-vibe-sha"
@@ -37,6 +40,7 @@ pull_repo() {
 }
 
 # Main
+cd "$REPO_DIR" || { log_error "Unable to cd to $REPO_DIR"; exit 1; }
 log_info "Checking for changes in $REPO..."
 
 
