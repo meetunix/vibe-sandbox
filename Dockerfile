@@ -53,6 +53,10 @@ echo "vibe available at: $(which vibe 2>/dev/null || echo NOT FOUND)"
 EOF
 
 RUN --mount=type=cache,target=/home/vibe-user/.cache/pipx,uid=1000,gid=1000 \
-    pipx install prek pre-commit mistral-vibe
+    pipx install prek pre-commit
+
+ARG CACHE_BUSTER=unknown
+RUN pipx install mistral-vibe
+
 
 ENTRYPOINT ["/home/vibe-user/.local/bin/vibe"]
