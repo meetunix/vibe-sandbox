@@ -7,9 +7,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_ENV=production
 
 RUN groupadd -g 1000 vibe && \
-    useradd -m -u 1000 -g vibe vibe-user
+    useradd -m -u 1000 -g vibe vibe-user && \
+    mkdir -p /workspace && chown -R vibe-user: /workspace && \
+    mkdir -p /home/vibe-user/.vibe && chown -R vibe-user: /home/vibe-user/.vibe
 
-RUN apt-get update && apt-get install -y \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     vim \
     nano \
     jq \
@@ -29,9 +33,7 @@ RUN apt-get update && apt-get install -y \
     openjdk-21-jdk \
     gradle \
     maven  \
-    golang-go `# required for pre-commit hooks like gitleaks (language: golang)` \
-    && apt autoclean -y \
-    && rm -rf /var/lib/apt/lists/*
+    golang-go `# required for pre-commit hooks like gitleaks (language: golang)`
 
 RUN mkdir -p /workspace && chown -R vibe-user: /workspace && \
     mkdir -p /home/vibe-user/.vibe && chown -R vibe-user: /home/vibe-user/.vibe
@@ -43,10 +45,14 @@ ENV PATH="/home/vibe-user/.local/bin:$PATH"
 ENV HOME="/home/vibe-user/"
 ENV VIBE_HOME="/home/vibe-user/.vibe"
 
-RUN pipx install prek pre-commit mistral-vibe
+RUN cat >> ~/.bashrc << 'EOF'
+export PATH="/home/vibe-user/.local/bin:$PATH"
+export VIBE_HOME="$HOME/.vibe"
+export PS1="vibe-sandbox:\w$ "
+echo "vibe available at: $(which vibe 2>/dev/null || echo NOT FOUND)"
+EOF
 
-RUN echo 'export PATH="/home/vibe-user/.local/bin:$PATH"' >> ~/.bashrc \
-    && echo 'export PS1="vibe-sandbox:\w$ "' >> ~/.bashrc \
-    && echo 'echo "vibe available at: $(which vibe 2>/dev/null || echo NOT FOUND)"' >> ~/.bashrc
+RUN --mount=type=cache,target=/home/vibe-user/.cache/pipx,uid=1000,gid=1000 \
+    pipx install prek pre-commit mistral-vibe
 
 ENTRYPOINT ["/home/vibe-user/.local/bin/vibe"]

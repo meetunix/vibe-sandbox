@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-if ! docker image inspect vibe-sandbox:latest &>/dev/null; then
+if ! docker image inspect nachtsieb/vibe-sandbox:latest &>/dev/null; then
   echo "Image 'vibe-sandbox:latest' not found. Building..."
   docker build -t vibe-sandbox:latest .
 fi
@@ -16,5 +16,5 @@ docker run \
   -v "${HOME}/.vibe-sandbox:/home/vibe-user/.vibe" \
   -v /etc/localtime:/etc/localtime:ro \
   -v /etc/timezone:/etc/timezone:ro \
-  vibe-sandbox:latest \
+  nachtsieb/vibe-sandbox:latest \
   "$@"

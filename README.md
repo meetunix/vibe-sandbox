@@ -1,6 +1,6 @@
 # vibe-sandbox
 
-Docker based sandbox for Mistral AI's vibe coding agent for python and Java developers.
+Docker based sandbox for Mistral AI's vibe coding agent for python and Java and go developers.
 
 ## Install
 
