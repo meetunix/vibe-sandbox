@@ -28,8 +28,17 @@ log_error() {
     echo "$msg" | systemd-cat -t "$IDENTIFIER" -p err
 }
 
+pull_repo() {
+    log_info "Pulling current repository..."
+    if ! git pull; then
+        log_error "Failed to pull the current repository."
+        exit 1
+    fi
+}
+
 # Main
 log_info "Checking for changes in $REPO..."
+
 
 LATEST=$(curl -sf "https://api.github.com/repos/$REPO/commits/main" | jq -r '.sha')
 
@@ -41,12 +50,14 @@ fi
 if [ ! -f "$COMMIT_HASH_FILE" ]; then
     log_info "Sthe state file \"$COMMIT_HASH_FILE\" was not found. Initializing first build."
     PREVIOUS=""
+    pull_repo
 else
     PREVIOUS=$(cat "$COMMIT_HASH_FILE")
 fi
 
 if [ "$LATEST" != "$PREVIOUS" ]; then
     log_info "Change detected: ${PREVIOUS:-none} -> $LATEST"
+    pull_repo
 
     log_info "Running build: $BUILD_CMD"
     export VIBE_COMMIT_SHA="$LATEST"
