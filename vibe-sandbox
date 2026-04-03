@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 
-if ! docker image inspect nachtsieb/vibe-sandbox:latest &>/dev/null; then
-  echo "Image 'vibe-sandbox:latest' not found. Building..."
-  docker build -t vibe-sandbox:latest .
-fi
-
 docker run \
   --rm \
   --name vibe-sandbox \
   --security-opt no-new-privileges=true \
   --cpus 2.0 \
   --memory 1G \
+  --pull "always" \
   -it \
   -v "${PWD}:/workspace" \
   -v "${HOME}/.vibe-sandbox:/home/vibe-user/.vibe" \
