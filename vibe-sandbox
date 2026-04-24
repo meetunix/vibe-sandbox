@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 
+# Generate a 5-character random string
+RANDOM_STRING=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 5)
+
 docker run \
   --rm \
-  --name vibe-sandbox \
+  --name vibe-sandbox-${RANDOM_STRING} \
   --security-opt no-new-privileges=true \
   --cpus 2.0 \
   --memory 1G \
