@@ -3,6 +3,17 @@
 # Generate a 5-character random string
 RANDOM_STRING=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 5)
 
+# Create .vibe-sandbox directory with proper permissions if it doesn't exist
+VIBE_SANDBOX_DIR="${HOME}/.vibe-sandbox"
+if [ ! -d "$VIBE_SANDBOX_DIR" ]; then
+  mkdir -p "$VIBE_SANDBOX_DIR"
+  chmod 700 "$VIBE_SANDBOX_DIR"
+fi
+
+# Get current user's UID and GID for proper container process execution
+CURRENT_UID=$(id -u)
+CURRENT_GID=$(id -g)
+
 docker run \
   --rm \
   --name vibe-sandbox-${RANDOM_STRING} \
@@ -12,8 +23,9 @@ docker run \
   --pull "always" \
   -it \
   -v "${PWD}:/workspace" \
-  -v "${HOME}/.vibe-sandbox:/home/vibe-user/.vibe" \
+  -v "${VIBE_SANDBOX_DIR}:/home/vibe-user/.vibe" \
   -v /etc/localtime:/etc/localtime:ro \
   -v /etc/timezone:/etc/timezone:ro \
+  --user "$CURRENT_UID:$CURRENT_GID" \
   nachtsieb/vibe-sandbox:latest \
   "$@"
