@@ -6,9 +6,9 @@ Docker-based sandbox for Mistral AI's vibe coding agent for Python, Java, and Go
 
 Make sure you have Docker installed.
 
-Link `vibe-sandbox` in your path:
+Download and install `vibe-sandbox`:
 ```plain
-ln -s "$PWD/vibe-sandbox" ~/.local/bin/vibe-sandbox
+curl -sSL https://codeberg.org/nachtsieb/vibe-sandbox/raw/branch/main/vibe-sandbox -o ~/.local/bin/vibe-sandbox && chmod +x ~/.local/bin/vibe-sandbox
 ```
 
 ## Use
