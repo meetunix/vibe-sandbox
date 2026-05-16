@@ -1,8 +1,11 @@
 FROM nachtsieb/vibe-sandbox-base:latest
 
+ENV PIPX_HOME=/opt/pipx
+ENV PIPX_BIN_DIR=/usr/local/bin
+ENV PIPX_MAN_DIR=/usr/local/share/man
+
 ARG CACHE_BUSTER=unknown
 RUN pipx install mistral-vibe && \
-    chmod a+rx /home/vibe-user && \
-    chmod -R a+rX /home/vibe-user/.local
+    chmod -R a+rX /opt/pipx
 
-ENTRYPOINT ["/home/vibe-user/.local/bin/vibe"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh", "vibe"]

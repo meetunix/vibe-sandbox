@@ -13,8 +13,10 @@ curl -sSL https://codeberg.org/nachtsieb/vibe-sandbox/raw/branch/main/vibe-sandb
 
 ## Use
 
-**Start the sandbox in the directory where you want to work**:
+No further setup is required. Change into the directory you want to work in and run:
 
 ```plain
 vibe-sandbox
 ```
+
+The script pulls the latest image automatically and handles user, permissions, and state directory (`~/.vibe-sandbox`) on its own.

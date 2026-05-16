@@ -26,6 +26,7 @@ docker run \
   -v "${VIBE_SANDBOX_DIR}:/home/vibe-user/.vibe" \
   -v /etc/localtime:/etc/localtime:ro \
   -v /etc/timezone:/etc/timezone:ro \
-  --user "$CURRENT_UID:$CURRENT_GID" \
+  -e HOST_UID="$CURRENT_UID" \
+  -e HOST_GID="$CURRENT_GID" \
   nachtsieb/vibe-sandbox:latest \
   "$@"

@@ -6,10 +6,12 @@ COPY --from=ghcr.io/astral-sh/ty:latest /ty /bin/
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_ENV=production
 
-RUN groupadd -g 1000 vibe && \
-    useradd -m -u 1000 -g vibe vibe-user && \
-    mkdir -p /workspace && chown -R vibe-user: /workspace && \
-    mkdir -p /home/vibe-user/.vibe && chown -R vibe-user: /home/vibe-user/.vibe
+# pipx writes venvs into PIPX_HOME and console-script shims into PIPX_BIN_DIR.
+# Pointing the latter at /usr/local/bin makes every installed tool available
+# to any user the entrypoint creates at runtime.
+ENV PIPX_HOME=/opt/pipx
+ENV PIPX_BIN_DIR=/usr/local/bin
+ENV PIPX_MAN_DIR=/usr/local/share/man
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
@@ -21,6 +23,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     wget \
     git \
     pipx \
+    gosu \
     git-lfs \
     net-tools \
     bind9-dnsutils \
@@ -35,22 +38,23 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     maven  \
     golang-go `# required for pre-commit hooks like gitleaks (language: golang)`
 
-RUN mkdir -p /workspace && chown -R vibe-user: /workspace && \
-    mkdir -p /home/vibe-user/.vibe && chown -R vibe-user: /home/vibe-user/.vibe
+RUN pipx install prek && \
+    pipx install pre-commit && \
+    chmod -R a+rX /opt/pipx
 
-USER vibe-user
-WORKDIR /workspace
+RUN mkdir -p /workspace
 
-ENV PATH="/home/vibe-user/.local/bin:$PATH"
-ENV HOME="/home/vibe-user/"
-ENV VIBE_HOME="/home/vibe-user/.vibe"
-
-RUN cat >> ~/.bashrc << 'EOF'
-export PATH="/home/vibe-user/.local/bin:$PATH"
+RUN cat >> /etc/skel/.bashrc << 'EOF'
+export PATH="/usr/local/bin:$PATH"
 export VIBE_HOME="$HOME/.vibe"
 export PS1="vibe-sandbox:\w$ "
 echo "vibe available at: $(which vibe 2>/dev/null || echo NOT FOUND)"
 EOF
 
-RUN --mount=type=cache,target=/home/vibe-user/.cache/pipx,uid=1000,gid=1000 \
-    pipx install prek pre-commit
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["bash"]
