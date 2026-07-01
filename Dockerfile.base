@@ -23,6 +23,12 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     wget \
     git \
     pipx \
+    shellcheck \
+    yamllint \
+    parallel \
+    postgresql-client \
+    mariadb-client \
+    sqlite3 \
     gosu \
     git-lfs \
     net-tools \
@@ -33,14 +39,22 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python-is-python3 \
     python3-pip \
     python3-venv \
+    python3-pandas \
     openjdk-21-jdk \
     gradle \
     maven  \
-    golang-go `# required for pre-commit hooks like gitleaks (language: golang)`
+    golang-go
 
 RUN pipx install prek && \
     pipx install pre-commit && \
     chmod -R a+rX /opt/pipx
+
+RUN curl -L https://dl.k8s.io/release/v1.35.5/bin/linux/amd64/kubectl > /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+
+RUN curl -L https://get.helm.sh/helm-v4.2.2-linux-amd64.tar.gz | tar -xz -C /tmp \
+    && mv /tmp/linux-amd64/helm /usr/local/bin/helm \
+    && chmod +x /usr/local/bin/helm \
+    && rm -rf /tmp/linux-amd64
 
 RUN mkdir -p /workspace
 
