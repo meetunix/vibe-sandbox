@@ -14,6 +14,26 @@ fi
 CURRENT_UID=$(id -u)
 CURRENT_GID=$(id -g)
 
+# Process --mount arguments
+MOUNT_ARGS=()
+CONTAINER_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mount)
+      MOUNT_ARGS+=("-v" "$2")
+      shift 2
+      ;;
+    *)
+      CONTAINER_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# Get current working directory for default workspace mount
+CURRENT_PWD=$(pwd)
+
 docker run \
   --rm \
   --name vibe-sandbox-${RANDOM_STRING} \
@@ -22,11 +42,12 @@ docker run \
   --memory 1G \
   --pull "always" \
   -it \
-  -v "${PWD}:/workspace" \
+  -v "${CURRENT_PWD}:/workspace" \
   -v "${VIBE_SANDBOX_DIR}:/home/vibe-user/.vibe" \
   -v /etc/localtime:/etc/localtime:ro \
   -v /etc/timezone:/etc/timezone:ro \
+  "${MOUNT_ARGS[@]}" \
   -e HOST_UID="$CURRENT_UID" \
   -e HOST_GID="$CURRENT_GID" \
   nachtsieb/vibe-sandbox:latest \
-  "$@"
+  "${CONTAINER_ARGS[@]}"

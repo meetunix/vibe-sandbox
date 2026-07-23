@@ -20,3 +20,8 @@ vibe-sandbox
 ```
 
 The script pulls the latest image automatically and handles user, permissions, and state directory (`~/.vibe-sandbox`) on its own.
+
+To mount additional host directories into the container, use `--mount`:
+```plain
+vibe-sandbox --mount /host/path:/container/path --mount /another/path:/another/container/path:ro
+```
