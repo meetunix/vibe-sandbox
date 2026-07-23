@@ -22,6 +22,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     curl \
     wget \
     git \
+    lftp \
     pipx \
     shellcheck \
     yamllint \
@@ -34,6 +35,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     net-tools \
     bind9-dnsutils \
     nmap \
+    iputils-ping \
+    traceroute \
+    tcpdump \
+    whois \
     ca-certificates \
     python3 \
     python-is-python3 \
@@ -43,6 +48,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     openjdk-25-jdk \
     gradle \
     maven  \
+    lua5.4  \
     golang-go
 
 RUN pipx install prek && \
@@ -57,7 +63,7 @@ RUN pipx install prek && \
     pipx install pylint && \
     chmod -R a+rX /opt/pipx
 
-RUN curl -L https://dl.k8s.io/release/v1.35.5/bin/linux/amd64/kubectl > /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+RUN curl -L https://dl.k8s.io/release/v1.35.7/bin/linux/amd64/kubectl > /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
 
 RUN curl -L https://get.helm.sh/helm-v4.2.2-linux-amd64.tar.gz | tar -xz -C /tmp \
     && mv /tmp/linux-amd64/helm /usr/local/bin/helm \
