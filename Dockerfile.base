@@ -54,7 +54,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 RUN pipx install prek && \
     pipx install pre-commit && \
-    pipx install ansible && \
+    pipx install ansible-core && \
     pipx install mutagen && \
     pipx install yamllint && \
     pipx install flake8 && \
