@@ -49,11 +49,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     gradle \
     maven  \
     lua5.4  \
+    ffmpeg  \
     golang-go
 
 RUN pipx install prek && \
     pipx install pre-commit && \
-    pipx install ansible-lint && \
+    pipx install ansible && \
+    pipx install mutagen && \
     pipx install yamllint && \
     pipx install flake8 && \
     pipx install black && \
