@@ -45,16 +45,22 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python3-pip \
     python3-venv \
     python3-pandas \
+    python3-scapy \
     openjdk-25-jdk \
     gradle \
     maven  \
     lua5.4  \
+    qpdf  \
+    ghostscript  \
     ffmpeg  \
+    openssl  \
+    lftp  \
+    gnupg2  \
+    telnet  \
     golang-go
 
 RUN pipx install prek && \
     pipx install pre-commit && \
-    pipx install ansible-core && \
     pipx install mutagen && \
     pipx install yamllint && \
     pipx install flake8 && \
@@ -64,6 +70,8 @@ RUN pipx install prek && \
     pipx install pydocstyle && \
     pipx install pylint && \
     chmod -R a+rX /opt/pipx
+
+RUN pipx install --include-deps ansible
 
 RUN curl -L https://dl.k8s.io/release/v1.35.7/bin/linux/amd64/kubectl > /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
 
