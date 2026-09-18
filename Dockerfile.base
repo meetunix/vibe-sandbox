@@ -33,6 +33,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     gosu \
     git-lfs \
     net-tools \
+    linux-perf \
+    bpftrace \
     bind9-dnsutils \
     nmap \
     iputils-ping \
