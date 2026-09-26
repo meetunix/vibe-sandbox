@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 
-# This script monitors a GitHub repository for new commits.
-# If a new commit SHA is detected (or if no previous state file exists),
-# it triggers a Docker build command. 
-# The latest commit hash is exported as `VIBE_COMMIT_SHA` to act as a 
+# This script monitors PyPI for new releases of mistral-vibe.
+# If a new version is detected (or if no previous state file exists),
+# it triggers a Docker build command.
+# The latest version is exported as `VIBE_VERSION` to act as a
 # cache-buster in the Dockerfile, ensuring the image rebuilds when mistral-vibe
 # is upgraded
 
-# Get the directory where this build.sh build.sh script is located
+# Get the directory where this build.sh script is located
 REPO_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 
 # Configuration
-REPO="mistralai/mistral-vibe"
-COMMIT_HASH_FILE=".mistral-vibe-sha"
+PACKAGE="mistral-vibe"
+VERSION_FILE=".mistral-vibe-version"
 IDENTIFIER="mistral-vibe-watcher"
 
 # Parse command line arguments
@@ -60,21 +60,21 @@ if [ "$BUILD_BASE" = true ]; then
         exit 1
     fi
 else
-    log_info "Checking for changes in $REPO..."
+    log_info "Checking for new releases of $PACKAGE on PyPI..."
 
-    LATEST=$(curl -sf "https://api.github.com/repos/$REPO/commits/main" | jq -r '.sha')
+    LATEST=$(curl -sf "https://pypi.org/pypi/$PACKAGE/json" | jq -r '.info.version // empty')
 
     if [ -z "$LATEST" ]; then
-        log_error "Failed to fetch latest commit hash (sha1) from GitHub API."
+        log_error "Failed to fetch latest version of $PACKAGE from PyPI."
         exit 1
     fi
 
-    if [ ! -f "$COMMIT_HASH_FILE" ]; then
-        log_info "Sthe state file \"$COMMIT_HASH_FILE\" was not found. Initializing first build."
+    if [ ! -f "$VERSION_FILE" ]; then
+        log_info "The state file \"$VERSION_FILE\" was not found. Initializing first build."
         PREVIOUS=""
         pull_repo
     else
-        PREVIOUS=$(cat "$COMMIT_HASH_FILE")
+        PREVIOUS=$(cat "$VERSION_FILE")
     fi
 
     if [ "$LATEST" != "$PREVIOUS" ]; then
@@ -82,16 +82,16 @@ else
         pull_repo
 
         log_info "Running build: $BUILD_CMD"
-        export VIBE_COMMIT_SHA="$LATEST"
+        export VIBE_VERSION="$LATEST"
 
         if $BUILD_CMD; then
-            echo "$LATEST" > "$COMMIT_HASH_FILE"
-            log_info "Build succeeded. commit hash \"$LATEST\" written to \"$COMMIT_HASH_FILE\"."
+            echo "$LATEST" > "$VERSION_FILE"
+            log_info "Build succeeded. version \"$LATEST\" written to \"$VERSION_FILE\"."
         else
-            log_error "Build failed! Commit hash not updated."
+            log_error "Build failed! Version not updated."
             exit 1
         fi
     else
-        log_info "No changes detected (commit hash: $LATEST)."
+        log_info "No new release detected (version: $LATEST)."
     fi
 fi
