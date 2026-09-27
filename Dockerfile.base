@@ -49,11 +49,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python3-venv \
     python3-pandas \
     python3-jsonschema \
+    python3-markdown2 \
     openjdk-25-jdk \
     gradle \
     maven  \
     lua5.4  \
     ffmpeg  \
+    pandoc \
     golang-go
 
 RUN pipx install prek && \
