@@ -60,6 +60,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     ffmpeg  \
     pandoc \
     cpanminus \
+    build-essential \
+    libssl-dev \
+    zlib1g-dev \
+    libexpat1-dev \
+    libxml2-dev \
     openssl  \
     lftp  \
     gnupg2  \
