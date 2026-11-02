@@ -21,7 +21,35 @@ vibe-sandbox
 
 The script pulls the latest image automatically and handles user, permissions, and state directory (`~/.vibe-sandbox`) on its own.
 
-To mount additional host directories into the container, use `--mount`:
+The current working directory is mounted into the container at `/workspace/<directory-name>`. If you run the script from `/home/user/my-project`, the project is available at `/workspace/my-project` inside the container.
+
+## Volumes
+
+To mount additional host directories into the container, use `--volume` (or the short form `-v`). The directory is mounted at `/workspace/<directory-name>`:
+
 ```plain
-vibe-sandbox --mount /host/path:/container/path --mount /another/path:/another/container/path:ro
+vibe-sandbox --volume /host/path/to/project_hell
 ```
+
+This mounts `/host/path/to/project_hell` at `/workspace/project_hell` inside the container.
+
+Optionally, an access mode can be appended:
+
+- `:ro` — read-only (default)
+- `:rw` — read/write
+
+```plain
+vibe-sandbox --volume /host/path/to/project_hell:rw
+```
+
+Custom container mountpoints are not permitted. Specifying a target path (e.g. `--volume /host/path:/opt/path:ro`) is rejected with an error. The host path must exist — the script does not create missing directories.
+
+## Upgrade
+
+The script can update itself to the latest version from codeberg.org:
+
+```plain
+vibe-sandbox upgrade
+```
+
+`update` works as an alias. The command downloads the current version from the repository, compares it with the installed one, and replaces the script in place if a different version is found. If the installed version is already current, nothing is changed.

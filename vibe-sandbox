@@ -1,12 +1,68 @@
 #!/usr/bin/env bash
 
+SCRIPT_VERSION="1.0.0"
+SCRIPT_URL="https://codeberg.org/nachtsieb/vibe-sandbox/raw/branch/main/vibe-sandbox"
+
+# Self-update: download the latest version from codeberg.org and replace this script
+upgrade_script() {
+  local tmp_file
+  tmp_file=$(mktemp) || exit 1
+  trap 'rm -f "$tmp_file"' EXIT
+
+  echo "Checking for updates..."
+  if ! curl -fsSL "$SCRIPT_URL" -o "$tmp_file"; then
+    echo "Error: could not download update from ${SCRIPT_URL}" >&2
+    exit 1
+  fi
+
+  local new_version
+  new_version=$(grep -m1 '^SCRIPT_VERSION=' "$tmp_file" | cut -d'"' -f2)
+  if [[ -z "$new_version" ]]; then
+    echo "Error: downloaded file does not contain a version." >&2
+    exit 1
+  fi
+
+  if [[ "$new_version" == "$SCRIPT_VERSION" ]]; then
+    echo "Already up to date (v${SCRIPT_VERSION})."
+    exit 0
+  fi
+
+  if ! bash -n "$tmp_file"; then
+    echo "Error: downloaded file is not a valid bash script, aborting update." >&2
+    exit 1
+  fi
+
+  local script_path
+  if [[ ! -f "$0" ]]; then
+    echo "Error: cannot upgrade when the script is not run from a file (e.g. curl | bash)." >&2
+    exit 1
+  fi
+  script_path=$(readlink -f "$0")
+  if ! cat "$tmp_file" > "$script_path"; then
+    echo "Error: could not write to ${script_path}." >&2
+    exit 1
+  fi
+
+  echo "Updated vibe-sandbox: v${SCRIPT_VERSION} -> v${new_version}"
+  exit 0
+}
+
+case "${1:-}" in
+  upgrade|update)
+    upgrade_script
+    ;;
+esac
+
 # Generate a 5-character random string
 RANDOM_STRING=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 5)
 
 # Create .vibe-sandbox directory with proper permissions if it doesn't exist
-VIBE_SANDBOX_DIR="${HOME}/.vibe-sandbox"
+VIBE_SANDBOX_DIR="${HOME:-}/.vibe-sandbox"
 if [ ! -d "$VIBE_SANDBOX_DIR" ]; then
-  mkdir -p "$VIBE_SANDBOX_DIR"
+  if ! mkdir -p "$VIBE_SANDBOX_DIR"; then
+    echo "Error: could not create state directory ${VIBE_SANDBOX_DIR}." >&2
+    exit 1
+  fi
   chmod 700 "$VIBE_SANDBOX_DIR"
 fi
 
@@ -14,14 +70,41 @@ fi
 CURRENT_UID=$(id -u)
 CURRENT_GID=$(id -g)
 
-# Process --mount arguments
+# Process --volume arguments
 MOUNT_ARGS=()
 CONTAINER_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --mount)
-      MOUNT_ARGS+=("-v" "$2")
+    --volume|-v)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: ${1} requires a non-empty host path as argument." >&2
+        exit 1
+      fi
+      VOLUME_ARG="$2"
+      VOLUME_PATH="${VOLUME_ARG%%:*}"
+      VOLUME_MODE="${VOLUME_ARG#*:}"
+      if [[ "$VOLUME_PATH" == "$VOLUME_ARG" ]]; then
+        # No mode suffix given, default to read-only
+        VOLUME_MODE="ro"
+      elif [[ "$VOLUME_MODE" != "ro" && "$VOLUME_MODE" != "rw" ]]; then
+        echo "Error: invalid volume '${VOLUME_ARG}'. Only ':ro' or ':rw' are allowed, custom mountpoints are not permitted." >&2
+        exit 1
+      fi
+      if [[ -z "$VOLUME_PATH" ]]; then
+        echo "Error: invalid volume '${VOLUME_ARG}'. Host path must not be empty." >&2
+        exit 1
+      fi
+      if ! VOLUME_PATH=$(readlink -f -- "$VOLUME_PATH") || [[ ! -e "$VOLUME_PATH" ]]; then
+        echo "Error: volume path '${VOLUME_ARG%%:*}' does not exist on the host." >&2
+        exit 1
+      fi
+      VOLUME_DIR_NAME=$(basename "$VOLUME_PATH")
+      if [[ "$VOLUME_DIR_NAME" == "/" ]]; then
+        echo "Error: refusing to mount the root directory." >&2
+        exit 1
+      fi
+      MOUNT_ARGS+=("-v" "${VOLUME_PATH}:/workspace/${VOLUME_DIR_NAME}:${VOLUME_MODE}")
       shift 2
       ;;
     *)
@@ -32,20 +115,37 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Get current working directory for default workspace mount
-CURRENT_PWD=$(pwd)
+if ! CURRENT_PWD=$(pwd) || [[ -z "$CURRENT_PWD" ]]; then
+  echo "Error: could not determine the current working directory." >&2
+  exit 1
+fi
+CURRENT_DIR_NAME=$(basename "$CURRENT_PWD")
+if [[ "$CURRENT_DIR_NAME" == "/" ]]; then
+  echo "Error: refusing to mount the root directory. Run from a project directory instead." >&2
+  exit 1
+fi
+
+# Mount host timezone files only if they exist, otherwise Docker would create
+# them as directories on the host
+TIME_MOUNT_ARGS=()
+if [ -e /etc/localtime ]; then
+  TIME_MOUNT_ARGS+=("-v" "/etc/localtime:/etc/localtime:ro")
+fi
+if [ -e /etc/timezone ]; then
+  TIME_MOUNT_ARGS+=("-v" "/etc/timezone:/etc/timezone:ro")
+fi
 
 docker run \
   --rm \
-  --name vibe-sandbox-${RANDOM_STRING} \
+  --name "vibe-sandbox-${RANDOM_STRING}" \
   --security-opt no-new-privileges=true \
   --cpus 2.0 \
-  --memory 1G \
+  --memory 2G \
   --pull "always" \
   -it \
-  -v "${CURRENT_PWD}:/workspace" \
+  -v "${CURRENT_PWD}:/workspace/${CURRENT_DIR_NAME}" \
   -v "${VIBE_SANDBOX_DIR}:/home/vibe-user/.vibe" \
-  -v /etc/localtime:/etc/localtime:ro \
-  -v /etc/timezone:/etc/timezone:ro \
+  "${TIME_MOUNT_ARGS[@]}" \
   "${MOUNT_ARGS[@]}" \
   -e HOST_UID="$CURRENT_UID" \
   -e HOST_GID="$CURRENT_GID" \
