@@ -44,6 +44,26 @@ vibe-sandbox --volume /host/path/to/project_hell:rw
 
 Custom container mountpoints are not permitted. Specifying a target path (e.g. `--volume /host/path:/opt/path:ro`) is rejected with an error. The host path must exist — the script does not create missing directories.
 
+## Voice mode
+
+To use vibe's voice mode (speak instead of type), run:
+
+```plain
+vibe-sandbox --voice
+```
+
+With `--voice`, the script passes the host audio hardware into the container whenever it finds it:
+
+- `/dev/snd` (ALSA devices) via `--device /dev/snd`, plus the host's `audio` group via `--group-add`
+- the PipeWire socket (`$XDG_RUNTIME_DIR/pipewire-0` or `/run/user/<uid>/pipewire-0`)
+- the PulseAudio socket (`$XDG_RUNTIME_DIR/pulse` or `/run/user/<uid>/pulse`) with `PULSE_SERVER` set accordingly
+
+`XDG_RUNTIME_DIR` is set inside the container to match the mounted sockets. If no audio device or socket is found on the host, a warning is printed and the container starts anyway.
+
+Voice mode is enabled inside the container only through the `VIBE_VOICE_MODE_ENABLED=true` environment variable. The script never reads or modifies your vibe configuration (`~/.vibe-sandbox/config.toml`) — all vibe settings (transcribe model, language, API key in `~/.vibe-sandbox/.env`, etc.) stay entirely under your control.
+
+Inside the vibe session, open `/voice` and press `Ctrl+T` to start/stop recording; the transcription is inserted into the prompt.
+
 ## Upgrade
 
 The script can update itself to the latest version from codeberg.org:

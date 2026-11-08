@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 SCRIPT_URL="https://codeberg.org/nachtsieb/vibe-sandbox/raw/branch/main/vibe-sandbox"
 
 # Self-update: download the latest version from codeberg.org and replace this script
@@ -73,9 +73,14 @@ CURRENT_GID=$(id -g)
 # Process --volume arguments
 MOUNT_ARGS=()
 CONTAINER_ARGS=()
+VOICE_MODE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --voice)
+      VOICE_MODE=1
+      shift
+      ;;
     --volume|-v)
       if [[ $# -lt 2 || -z "${2:-}" ]]; then
         echo "Error: ${1} requires a non-empty host path as argument." >&2
@@ -135,6 +140,40 @@ if [ -e /etc/timezone ]; then
   TIME_MOUNT_ARGS+=("-v" "/etc/timezone:/etc/timezone:ro")
 fi
 
+# Voice mode: pass the host audio hardware into the container and enable
+# vibe's voice mode via an environment variable only. The vibe configuration
+# in the state directory (~/.vibe-sandbox, mounted as ~/.vibe) is never read
+# or modified by this script.
+VOICE_ARGS=()
+if [[ "$VOICE_MODE" == "1" ]]; then
+  # Honor XDG_RUNTIME_DIR when set, fall back to /run/user/<uid>
+  HOST_RUN_DIR="${XDG_RUNTIME_DIR:-/run/user/${CURRENT_UID}}"
+  AUDIO_FOUND=0
+  if [ -d /dev/snd ] && [ -n "$(ls -A /dev/snd 2>/dev/null)" ]; then
+    VOICE_ARGS+=("--device" "/dev/snd")
+    AUDIO_GID=$(getent group audio 2>/dev/null | cut -d: -f3)
+    if [[ -n "$AUDIO_GID" ]]; then
+      VOICE_ARGS+=("--group-add" "$AUDIO_GID")
+    fi
+    AUDIO_FOUND=1
+  fi
+  if [ -e "${HOST_RUN_DIR}/pipewire-0" ]; then
+    VOICE_ARGS+=("-v" "${HOST_RUN_DIR}/pipewire-0:/run/user/${CURRENT_UID}/pipewire-0")
+    AUDIO_FOUND=1
+  fi
+  if [ -d "${HOST_RUN_DIR}/pulse" ]; then
+    VOICE_ARGS+=("-v" "${HOST_RUN_DIR}/pulse:/run/user/${CURRENT_UID}/pulse")
+    VOICE_ARGS+=("-e" "PULSE_SERVER=unix:/run/user/${CURRENT_UID}/pulse")
+    AUDIO_FOUND=1
+  fi
+  if [[ "$AUDIO_FOUND" == "1" ]]; then
+    VOICE_ARGS+=("-e" "XDG_RUNTIME_DIR=/run/user/${CURRENT_UID}")
+  else
+    echo "Warning: --voice given, but no audio device (/dev/snd) or PipeWire/PulseAudio socket found on the host; voice mode may not work." >&2
+  fi
+  VOICE_ARGS+=("-e" "VIBE_VOICE_MODE_ENABLED=true")
+fi
+
 docker run \
   --rm \
   --name "vibe-sandbox-${RANDOM_STRING}" \
@@ -147,6 +186,7 @@ docker run \
   -v "${VIBE_SANDBOX_DIR}:/home/vibe-user/.vibe" \
   "${TIME_MOUNT_ARGS[@]}" \
   "${MOUNT_ARGS[@]}" \
+  "${VOICE_ARGS[@]}" \
   -e HOST_UID="$CURRENT_UID" \
   -e HOST_GID="$CURRENT_GID" \
   nachtsieb/vibe-sandbox:latest \

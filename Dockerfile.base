@@ -33,6 +33,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     sqlite3 \
     gosu \
     git-lfs \
+    alsa-utils \
+    libasound2 \
+    libasound2-plugins \
+    libpulse0 \
     net-tools \
     linux-perf \
     bpftrace \
