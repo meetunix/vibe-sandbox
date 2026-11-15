@@ -6,12 +6,21 @@ COPY --from=ghcr.io/astral-sh/ty:latest /ty /bin/
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_ENV=production
 
-# pipx writes venvs into PIPX_HOME and console-script shims into PIPX_BIN_DIR.
-# Pointing the latter at /usr/local/bin makes every installed tool available
-# to any user the entrypoint creates at runtime.
-ENV PIPX_HOME=/opt/pipx
-ENV PIPX_BIN_DIR=/usr/local/bin
-ENV PIPX_MAN_DIR=/usr/local/share/man
+# uv installs every tool into its own venv below UV_TOOL_DIR and links the
+# console scripts into UV_TOOL_BIN_DIR. Pointing the latter at /usr/local/bin
+# makes every installed tool available to any user the entrypoint creates at
+# runtime.
+ENV UV_TOOL_DIR=/opt/uv/tools
+ENV UV_TOOL_BIN_DIR=/usr/local/bin
+
+# Fixed cache location, so the Dockerfiles can mount a BuildKit cache there.
+ENV UV_CACHE_DIR=/root/.cache/uv
+# Never download a uv-managed Python: the image ships Debian's python3.
+ENV UV_PYTHON_PREFERENCE=only-system
+# The cache mount is a separate filesystem, so hardlinks are impossible and uv
+# would warn on every install.
+ENV UV_LINK_MODE=copy
+ENV UV_COMPILE_BYTECODE=1
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
@@ -23,7 +32,6 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     wget \
     git \
     lftp \
-    pipx \
     shellcheck \
     yamllint \
     parallel \
@@ -91,19 +99,25 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     libfile-homedir-perl \
     libcapture-tiny-perl
 
-RUN pipx install prek && \
-    pipx install ansible && \
-    pipx install mutagen && \
-    pipx install yamllint && \
-    pipx install flake8 && \
-    pipx install black && \
-    pipx install isort && \
-    pipx install bandit && \
-    pipx install pydocstyle && \
-    pipx install pylint && \
-    chmod -R a+rX /opt/pipx
-
-RUN pipx install --include-deps ansible
+# `ansible` ships no console scripts of its own - the CLIs live in ansible-core,
+# which is why the pipx setup needed a second `--include-deps` install.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eux; \
+    for tool in \
+        prek \
+        mutagen \
+        yamllint \
+        flake8 \
+        black \
+        isort \
+        bandit \
+        pydocstyle \
+        pylint \
+    ; do \
+        uv tool install --python /usr/bin/python3 "$tool"; \
+    done; \
+    uv tool install --python /usr/bin/python3 ansible --with-executables-from ansible-core; \
+    chmod -R a+rX /opt/uv
 
 RUN curl -L https://dl.k8s.io/release/v1.35.7/bin/linux/amd64/kubectl > /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
 
