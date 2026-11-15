@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 SCRIPT_URL="https://codeberg.org/nachtsieb/vibe-sandbox/raw/branch/main/vibe-sandbox"
 
 # Self-update: download the latest version from codeberg.org and replace this script
@@ -179,7 +179,7 @@ docker run \
   --name "vibe-sandbox-${RANDOM_STRING}" \
   --security-opt no-new-privileges=true \
   --cpus 2.0 \
-  --memory 2G \
+  --memory 4G \
   --pull "always" \
   -it \
   -v "${CURRENT_PWD}:/workspace/${CURRENT_DIR_NAME}" \
