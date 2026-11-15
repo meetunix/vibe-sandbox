@@ -26,8 +26,13 @@ ENV UV_PYTHON_PREFERENCE=only-system
 ENV UV_LINK_MODE=copy
 ENV UV_COMPILE_BYTECODE=1
 
+# debian:13-slim ships /etc/apt/apt.conf.d/docker-clean, which deletes every
+# downloaded .deb after apt runs. That empties the cache mount below before the
+# layer is committed, so each rebuild downloads all packages again. Dropping the
+# hook keeps the .debs in the cache mount, where they belong.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
     apt-get update && apt-get install -y --no-install-recommends \
     vim \
     nano \
