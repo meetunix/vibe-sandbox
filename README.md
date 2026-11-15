@@ -44,6 +44,16 @@ vibe-sandbox --volume /host/path/to/project_hell:rw
 
 Custom container mountpoints are not permitted. Specifying a target path (e.g. `--volume /host/path:/opt/path:ro`) is rejected with an error. The host path must exist — the script does not create missing directories.
 
+## Resource limits
+
+The container is limited to 2 CPUs and 4 GB of memory by default. Both can be changed per run:
+
+```plain
+vibe-sandbox --cpu 4 --mem 8g
+```
+
+`--cpu` (also `--cpus`) takes a positive number of CPUs; fractions are allowed (`1.5`). `--mem` (also `--memory`) takes a size with an optional unit suffix (`b`, `k`, `m`, `g`, also `kb`/`kib` and so on); fractions are allowed (`1.5g`), and a value without a suffix is interpreted as bytes. Both values are passed straight to `docker run --cpus` and `--memory`.
+
 ## Voice mode
 
 To use vibe's voice mode (speak instead of type), run:

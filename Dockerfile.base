@@ -13,8 +13,12 @@ ENV NODE_ENV=production
 ENV UV_TOOL_DIR=/opt/uv/tools
 ENV UV_TOOL_BIN_DIR=/usr/local/bin
 
-# Fixed cache location, so the Dockerfiles can mount a BuildKit cache there.
-ENV UV_CACHE_DIR=/root/.cache/uv
+# The uv cache is a build-time concern only: it lives in a BuildKit cache mount
+# and is set inline in the RUN commands below. It must not be an image-wide ENV,
+# because /root/.cache/uv is not writable for the unprivileged user the
+# entrypoint creates at runtime - any uv command that touches the cache would
+# fail there.
+
 # Never download a uv-managed Python: the image ships Debian's python3.
 ENV UV_PYTHON_PREFERENCE=only-system
 # The cache mount is a separate filesystem, so hardlinks are impossible and uv
@@ -100,9 +104,11 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     libcapture-tiny-perl
 
 # `ansible` ships no console scripts of its own - the CLIs live in ansible-core,
-# which is why the pipx setup needed a second `--include-deps` install.
+# which is why the install needs `--with-executables-from ansible-core` to link
+# them into UV_TOOL_BIN_DIR.
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eux; \
+    export UV_CACHE_DIR=/root/.cache/uv; \
     for tool in \
         prek \
         mutagen \

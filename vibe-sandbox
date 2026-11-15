@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
 SCRIPT_URL="https://codeberg.org/nachtsieb/vibe-sandbox/raw/branch/main/vibe-sandbox"
 
 # Self-update: download the latest version from codeberg.org and replace this script
@@ -75,11 +75,39 @@ MOUNT_ARGS=()
 CONTAINER_ARGS=()
 VOICE_MODE=0
 
+# Resource limits, overridable via --cpu and --mem
+CPU_LIMIT="2.0"
+MEM_LIMIT="4G"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --voice)
       VOICE_MODE=1
       shift
+      ;;
+    --cpu|--cpus)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: ${1} requires a non-empty value as argument." >&2
+        exit 1
+      fi
+      if [[ ! "$2" =~ ^[0-9]+(\.[0-9]+)?$ || "$2" =~ ^0+(\.0+)?$ ]]; then
+        echo "Error: invalid CPU limit '$2'. Expected a positive number, e.g. 1.5." >&2
+        exit 1
+      fi
+      CPU_LIMIT="$2"
+      shift 2
+      ;;
+    --mem|--memory)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "Error: ${1} requires a non-empty value as argument." >&2
+        exit 1
+      fi
+      if [[ ! "$2" =~ ^[0-9]+(\.[0-9]+)?([bBkKmMgG]([iI]?[bB])?)?$ || "$2" =~ ^0+(\.0+)?([bBkKmMgG]([iI]?[bB])?)?$ ]]; then
+        echo "Error: invalid memory limit '$2'. Expected a size like 512m or 1.5g." >&2
+        exit 1
+      fi
+      MEM_LIMIT="$2"
+      shift 2
       ;;
     --volume|-v)
       if [[ $# -lt 2 || -z "${2:-}" ]]; then
@@ -178,8 +206,8 @@ docker run \
   --rm \
   --name "vibe-sandbox-${RANDOM_STRING}" \
   --security-opt no-new-privileges=true \
-  --cpus 2.0 \
-  --memory 4G \
+  --cpus "$CPU_LIMIT" \
+  --memory "$MEM_LIMIT" \
   --pull "always" \
   -it \
   -v "${CURRENT_PWD}:/workspace/${CURRENT_DIR_NAME}" \
