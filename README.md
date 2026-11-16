@@ -21,6 +21,8 @@ vibe-sandbox
 
 The script pulls the latest image automatically and handles user, permissions, and state directory (`~/.vibe-sandbox`) on its own.
 
+Run `vibe-sandbox` as a regular user. It refuses to run as root: the sandbox maps the invoking user into the container, and a root run would silently lose the state directory.
+
 The current working directory is mounted into the container at `/workspace/<directory-name>`. If you run the script from `/home/user/my-project`, the project is available at `/workspace/my-project` inside the container.
 
 ## Volumes
@@ -53,6 +55,16 @@ vibe-sandbox --cpu 4 --mem 8g
 ```
 
 `--cpu` (also `--cpus`) takes a positive number of CPUs; fractions are allowed (`1.5`). `--mem` (also `--memory`) takes a size with an optional unit suffix (`b`, `k`, `m`, `g`, also `kb`/`kib` and so on); fractions are allowed (`1.5g`), and a value without a suffix is interpreted as bytes. Both values are passed straight to `docker run --cpus` and `--memory`.
+
+## NVIDIA GPUs
+
+To pass the host's NVIDIA GPUs into the container, run:
+
+```plain
+vibe-sandbox --gpus
+```
+
+This adds `--gpus=all` to the `docker run` call, so all host GPUs are visible inside the sandbox. The host needs Docker with the NVIDIA Container Toolkit installed; without it, Docker aborts the run with `could not select device driver "" with capabilities: [[gpu]]`.
 
 ## Voice mode
 
