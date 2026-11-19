@@ -1,236 +1,1478 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
+"""Run Mistral Vibe in a Docker sandbox.
 
-SCRIPT_VERSION="1.3.0"
-SCRIPT_URL="https://codeberg.org/nachtsieb/vibe-sandbox/raw/branch/main/vibe-sandbox"
+Standard library only, Python 3.10 or newer.
+"""
 
-# Self-update: download the latest version from codeberg.org and replace this script
-upgrade_script() {
-  local tmp_file
-  tmp_file=$(mktemp) || exit 1
-  trap 'rm -f "$tmp_file"' EXIT
+from __future__ import annotations
 
-  echo "Checking for updates..."
-  if ! curl -fsSL "$SCRIPT_URL" -o "$tmp_file"; then
-    echo "Error: could not download update from ${SCRIPT_URL}" >&2
-    exit 1
-  fi
+import argparse
+import base64
+import binascii
+import contextlib
+import hashlib
+import os
+import posixpath
+import re
+import secrets
+import select
+import shlex
+import shutil
+import signal
+import socket
+import string
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Sequence
+from pathlib import Path
 
-  local new_version
-  new_version=$(grep -m1 '^SCRIPT_VERSION=' "$tmp_file" | cut -d'"' -f2)
-  if [[ -z "$new_version" ]]; then
-    echo "Error: downloaded file does not contain a version." >&2
-    exit 1
-  fi
+try:
+    import grp
+except ImportError:  # non-POSIX host
+    grp = None  # type: ignore[assignment]
 
-  if [[ "$new_version" == "$SCRIPT_VERSION" ]]; then
-    echo "Already up to date (v${SCRIPT_VERSION})."
-    exit 0
-  fi
+SCRIPT_VERSION = "2.0.0"
+SCRIPT_URL = "https://codeberg.org/nachtsieb/vibe-sandbox/raw/branch/main/vibe-sandbox"
+SIGNATURE_URL = SCRIPT_URL + ".sig"
+IMAGE = "nachtsieb/vibe-sandbox:latest"
 
-  if ! bash -n "$tmp_file"; then
-    echo "Error: downloaded file is not a valid bash script, aborting update." >&2
-    exit 1
-  fi
+# Ed25519 public keys trusted to sign releases, base64 of the raw 32 bytes.
+# Generate a key pair once, offline, and keep the private key off every machine
+# that builds or serves releases:
+#   openssl genpkey -algorithm ed25519 -out release.pem
+#   openssl pkey -in release.pem -pubout -outform DER | tail -c 32 | base64 -w0
+# Add further keys here to rotate; an empty tuple makes upgrade fail closed.
+RELEASE_KEYS: tuple[str, ...] = ()
 
-  local script_path
-  if [[ ! -f "$0" ]]; then
-    echo "Error: cannot upgrade when the script is not run from a file (e.g. curl | bash)." >&2
-    exit 1
-  fi
-  script_path=$(readlink -f "$0")
-  if ! cat "$tmp_file" > "$script_path"; then
-    echo "Error: could not write to ${script_path}." >&2
-    exit 1
-  fi
+CONTAINER_HOME = "/home/vibe-user"
+CONTAINER_WORKSPACE = "/workspace"
+CONTAINER_VIBE_HOME = CONTAINER_HOME + "/.vibe"
 
-  echo "Updated vibe-sandbox: v${SCRIPT_VERSION} -> v${new_version}"
-  exit 0
-}
+DEFAULT_MEMORY = "4G"
+DEFAULT_CPUS = "2.0"
+DEFAULT_CONFIG_DIRNAME = ".vibe-sandbox"
 
-case "${1:-}" in
-  upgrade|update)
-    upgrade_script
-    ;;
-esac
+MAX_SCRIPT_BYTES = 1 << 20
+MAX_SIGNATURE_BYTES = 4096
 
-# Refuse to run as root: the entrypoint would skip user creation and run as
-# root, the mounted state directory would not be used, and all vibe state
-# would be lost when the container is removed.
-if [[ "$(id -u)" == "0" ]]; then
-  echo "Error: refusing to run as root. Run vibe-sandbox as a regular user instead." >&2
-  exit 1
-fi
+# Clipboard bridge: the container never reaches the display server, it asks this
+# process for one image over a per-session unix socket.
+CLIPBOARD_SOCKET_DIR = "/tmp/vibe-clipboard"
+CLIPBOARD_SOCKET = CLIPBOARD_SOCKET_DIR + "/clip.sock"
+CLIPBOARD_BIN = "/usr/local/bin/vibe-paste"
+CLIPBOARD_PASTE_DIRNAME = "vibe-pasted-images"
+CLIPBOARD_TARGETS = "TARGETS"
+CLIPBOARD_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+CLIPBOARD_MAX_REQUEST_BYTES = 256
+CLIPBOARD_MAX_TARGETS_BYTES = 4096
+CLIPBOARD_TOOL_TIMEOUT = 2.0
+CLIPBOARD_EMPTY_CACHE_SECONDS = 1.0
+# A tty's atime advances when a read returns data, so an abandoned sandbox goes
+# idle while the one being typed into does not. Coarse: a brake, not focus detection.
+CLIPBOARD_RECENT_INPUT_SECONDS = 30.0
+CLIPBOARD_IMAGE_MIME = re.compile(r"image/[A-Za-z0-9][A-Za-z0-9.+-]{0,63}")
 
-# Generate a 5-character random string
-RANDOM_STRING=$(tr -dc 'a-z0-9' < /dev/urandom | head -c 5)
+# Host paths that must never be bind-mounted into the container.
+FORBIDDEN_MOUNT_ROOTS = (Path("/proc"), Path("/sys"), Path("/dev"))
+DOCKER_SOCKETS = frozenset({Path("/var/run/docker.sock"), Path("/run/docker.sock")})
 
-# Create .vibe-sandbox directory with proper permissions if it doesn't exist
-VIBE_SANDBOX_DIR="${HOME:-}/.vibe-sandbox"
-if [ ! -d "$VIBE_SANDBOX_DIR" ]; then
-  if ! mkdir -p "$VIBE_SANDBOX_DIR"; then
-    echo "Error: could not create state directory ${VIBE_SANDBOX_DIR}." >&2
-    exit 1
-  fi
-  chmod 700 "$VIBE_SANDBOX_DIR"
-fi
+# Home entries whose exposure is worth a warning when mounted.
+SENSITIVE_HOME_ENTRIES = (
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".kube",
+    ".docker",
+    ".config",
+    ".vibe",
+    ".vibe-sandbox",
+)
 
-# Get current user's UID and GID for proper container process execution
-CURRENT_UID=$(id -u)
-CURRENT_GID=$(id -g)
+# docker run flags that weaken the isolation the sandbox establishes.
+ISOLATION_WEAKENING_FLAGS = frozenset(
+    {
+        "--privileged",
+        "--pid",
+        "--ipc",
+        "--net",
+        "--network",
+        "--userns",
+        "--uts",
+        "--cgroupns",
+        "--cap-add",
+        "--device",
+        "--mount",
+        "--volume",
+        "-v",
+        "--entrypoint",
+        "--env-file",
+        "--group-add",
+        "--security-opt",
+    }
+)
 
-# Process --volume arguments
-MOUNT_ARGS=()
-CONTAINER_ARGS=()
-GPU_ARGS=()
-VOICE_MODE=0
+_CPUS_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+_MEMORY_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)?(?:[bBkKmMgG](?:[iI]?[bB])?)?$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SSH_KEY_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_VERSION_RE = re.compile(r'^SCRIPT_VERSION\s*=\s*["\']([^"\']+)["\']', re.MULTILINE)
 
-# Resource limits, overridable via --cpu and --mem
-CPU_LIMIT="2.0"
-MEM_LIMIT="4G"
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --voice)
-      VOICE_MODE=1
-      shift
-      ;;
-    --cpu|--cpus)
-      if [[ $# -lt 2 || -z "${2:-}" ]]; then
-        echo "Error: ${1} requires a non-empty value as argument." >&2
-        exit 1
-      fi
-      if [[ ! "$2" =~ ^[0-9]+(\.[0-9]+)?$ || "$2" =~ ^0+(\.0+)?$ ]]; then
-        echo "Error: invalid CPU limit '$2'. Expected a positive number, e.g. 1.5." >&2
-        exit 1
-      fi
-      CPU_LIMIT="$2"
-      shift 2
-      ;;
-    --mem|--memory)
-      if [[ $# -lt 2 || -z "${2:-}" ]]; then
-        echo "Error: ${1} requires a non-empty value as argument." >&2
-        exit 1
-      fi
-      if [[ ! "$2" =~ ^[0-9]+(\.[0-9]+)?([bBkKmMgG]([iI]?[bB])?)?$ || "$2" =~ ^0+(\.0+)?([bBkKmMgG]([iI]?[bB])?)?$ ]]; then
-        echo "Error: invalid memory limit '$2'. Expected a size like 512m or 1.5g." >&2
-        exit 1
-      fi
-      MEM_LIMIT="$2"
-      shift 2
-      ;;
-    --gpus)
-      # NVIDIA GPU passthrough: expose all host GPUs (docker --gpus=all)
-      GPU_ARGS=(--gpus all)
-      shift
-      ;;
-    --volume|-v)
-      if [[ $# -lt 2 || -z "${2:-}" ]]; then
-        echo "Error: ${1} requires a non-empty host path as argument." >&2
-        exit 1
-      fi
-      VOLUME_ARG="$2"
-      VOLUME_PATH="${VOLUME_ARG%%:*}"
-      VOLUME_MODE="${VOLUME_ARG#*:}"
-      if [[ "$VOLUME_PATH" == "$VOLUME_ARG" ]]; then
-        # No mode suffix given, default to read-only
-        VOLUME_MODE="ro"
-      elif [[ "$VOLUME_MODE" != "ro" && "$VOLUME_MODE" != "rw" ]]; then
-        echo "Error: invalid volume '${VOLUME_ARG}'. Only ':ro' or ':rw' are allowed, custom mountpoints are not permitted." >&2
-        exit 1
-      fi
-      if [[ -z "$VOLUME_PATH" ]]; then
-        echo "Error: invalid volume '${VOLUME_ARG}'. Host path must not be empty." >&2
-        exit 1
-      fi
-      if ! VOLUME_PATH=$(readlink -f -- "$VOLUME_PATH") || [[ ! -e "$VOLUME_PATH" ]]; then
-        echo "Error: volume path '${VOLUME_ARG%%:*}' does not exist on the host." >&2
-        exit 1
-      fi
-      VOLUME_DIR_NAME=$(basename "$VOLUME_PATH")
-      if [[ "$VOLUME_DIR_NAME" == "/" ]]; then
-        echo "Error: refusing to mount the root directory." >&2
-        exit 1
-      fi
-      MOUNT_ARGS+=("-v" "${VOLUME_PATH}:/workspace/${VOLUME_DIR_NAME}:${VOLUME_MODE}")
-      shift 2
-      ;;
-    *)
-      CONTAINER_ARGS+=("$1")
-      shift
-      ;;
-  esac
-done
+class SandboxError(Exception):
+    """Fatal error reported to the user without a traceback."""
 
-# Get current working directory for default workspace mount
-if ! CURRENT_PWD=$(pwd) || [[ -z "$CURRENT_PWD" ]]; then
-  echo "Error: could not determine the current working directory." >&2
-  exit 1
-fi
-CURRENT_DIR_NAME=$(basename "$CURRENT_PWD")
-if [[ "$CURRENT_DIR_NAME" == "/" ]]; then
-  echo "Error: refusing to mount the root directory. Run from a project directory instead." >&2
-  exit 1
-fi
 
-# Mount host timezone files only if they exist, otherwise Docker would create
-# them as directories on the host
-TIME_MOUNT_ARGS=()
-if [ -e /etc/localtime ]; then
-  TIME_MOUNT_ARGS+=("-v" "/etc/localtime:/etc/localtime:ro")
-fi
-if [ -e /etc/timezone ]; then
-  TIME_MOUNT_ARGS+=("-v" "/etc/timezone:/etc/timezone:ro")
-fi
+def warn(message: str) -> None:
+    print(f"vibe-sandbox: warning: {message}", file=sys.stderr)
 
-# Voice mode: pass the host audio hardware into the container and enable
-# vibe's voice mode via an environment variable only. The vibe configuration
-# in the state directory (~/.vibe-sandbox, mounted as ~/.vibe) is never read
-# or modified by this script.
-VOICE_ARGS=()
-if [[ "$VOICE_MODE" == "1" ]]; then
-  # Honor XDG_RUNTIME_DIR when set, fall back to /run/user/<uid>
-  HOST_RUN_DIR="${XDG_RUNTIME_DIR:-/run/user/${CURRENT_UID}}"
-  AUDIO_FOUND=0
-  if [ -d /dev/snd ] && [ -n "$(ls -A /dev/snd 2>/dev/null)" ]; then
-    VOICE_ARGS+=("--device" "/dev/snd")
-    AUDIO_GID=$(getent group audio 2>/dev/null | cut -d: -f3)
-    if [[ -n "$AUDIO_GID" ]]; then
-      VOICE_ARGS+=("--group-add" "$AUDIO_GID")
-    fi
-    AUDIO_FOUND=1
-  fi
-  if [ -e "${HOST_RUN_DIR}/pipewire-0" ]; then
-    VOICE_ARGS+=("-v" "${HOST_RUN_DIR}/pipewire-0:/run/user/${CURRENT_UID}/pipewire-0")
-    AUDIO_FOUND=1
-  fi
-  if [ -d "${HOST_RUN_DIR}/pulse" ]; then
-    VOICE_ARGS+=("-v" "${HOST_RUN_DIR}/pulse:/run/user/${CURRENT_UID}/pulse")
-    VOICE_ARGS+=("-e" "PULSE_SERVER=unix:/run/user/${CURRENT_UID}/pulse")
-    AUDIO_FOUND=1
-  fi
-  if [[ "$AUDIO_FOUND" == "1" ]]; then
-    VOICE_ARGS+=("-e" "XDG_RUNTIME_DIR=/run/user/${CURRENT_UID}")
-  else
-    echo "Warning: --voice given, but no audio device (/dev/snd) or PipeWire/PulseAudio socket found on the host; voice mode may not work." >&2
-  fi
-  VOICE_ARGS+=("-e" "VIBE_VOICE_MODE_ENABLED=true")
-fi
 
-docker run \
-  --rm \
-  --name "vibe-sandbox-${RANDOM_STRING}" \
-  --security-opt no-new-privileges=true \
-  --cpus "$CPU_LIMIT" \
-  --memory "$MEM_LIMIT" \
-  "${GPU_ARGS[@]}" \
-  --pull "always" \
-  -it \
-  -v "${CURRENT_PWD}:/workspace/${CURRENT_DIR_NAME}" \
-  -v "${VIBE_SANDBOX_DIR}:/home/vibe-user/.vibe" \
-  "${TIME_MOUNT_ARGS[@]}" \
-  "${MOUNT_ARGS[@]}" \
-  "${VOICE_ARGS[@]}" \
-  -e HOST_UID="$CURRENT_UID" \
-  -e HOST_GID="$CURRENT_GID" \
-  nachtsieb/vibe-sandbox:latest \
-  "${CONTAINER_ARGS[@]}"
+def home_dir() -> Path:
+    try:
+        return Path.home()
+    except RuntimeError as exc:
+        raise SandboxError(f"could not determine the home directory: {exc}") from exc
+
+
+# --- validation -----------------------------------------------------------
+
+
+def validate_cpus(value: str) -> str:
+    if not _CPUS_RE.match(value) or float(value) <= 0:
+        raise SandboxError(
+            f"invalid CPU limit {value!r}: expected a positive number, e.g. 1.5"
+        )
+    return value
+
+
+def validate_memory(value: str) -> str:
+    number = re.match(r"[0-9]+(?:\.[0-9]+)?", value)
+    if not _MEMORY_RE.match(value) or number is None or float(number.group(0)) <= 0:
+        raise SandboxError(
+            f"invalid memory limit {value!r}: expected a size like 512m or 1.5g"
+        )
+    return value
+
+
+def resolve_directory(raw: str, what: str) -> Path:
+    try:
+        resolved = Path(raw).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise SandboxError(f"{what} {raw!r} does not exist: {exc}") from exc
+    if not resolved.is_dir():
+        raise SandboxError(f"{what} {raw!r} is not a directory")
+    return resolved
+
+
+def reject_forbidden_mount(path: Path, what: str) -> None:
+    if path == Path("/"):
+        raise SandboxError(f"refusing to use the root directory as {what}")
+    for forbidden in FORBIDDEN_MOUNT_ROOTS:
+        if path == forbidden or forbidden in path.parents:
+            raise SandboxError(
+                f"refusing to use {path} as {what}: {forbidden} is not mountable"
+            )
+
+
+def is_sensitive_path(path: Path) -> bool:
+    home = home_dir()
+    if path == home or path in home.parents:
+        return True
+    for entry in SENSITIVE_HOME_ENTRIES:
+        target = home / entry
+        if path == target or path in target.parents or target in path.parents:
+            return True
+    return False
+
+
+# --- mounts ---------------------------------------------------------------
+
+
+class MountPlan:
+    """Collects docker mounts and rejects duplicate destinations."""
+
+    def __init__(self) -> None:
+        self._destinations: dict[str, str] = {}
+        self.args: list[str] = []
+
+    def bind(self, source: Path, destination: str, mode: str) -> None:
+        if ":" in str(source):
+            raise SandboxError(
+                f"refusing to mount {source}: ':' is not supported in host paths"
+            )
+        self._claim(destination, str(source))
+        self.args += ["-v", f"{source}:{destination}:{mode}"]
+
+    def tmpfs(self, destination: str, options: str) -> None:
+        self._claim(destination, "tmpfs")
+        self.args += ["--tmpfs", f"{destination}:{options}"]
+
+    def _claim(self, destination: str, source: str) -> None:
+        if ":" in destination:
+            raise SandboxError(
+                f"refusing to mount at {destination}: ':' is not supported in container paths"
+            )
+        previous = self._destinations.get(destination)
+        if previous is not None:
+            raise SandboxError(
+                f"mount destination {destination} is already used by {previous}"
+            )
+        self._destinations[destination] = source
+
+
+def parse_volume(spec: str) -> tuple[Path, str]:
+    """Split '<host-path>[:ro|:rw]' into a resolved host path and an access mode."""
+    path_part, mode = spec, "ro"
+    head, separator, tail = spec.rpartition(":")
+    if separator and tail in ("ro", "rw"):
+        path_part, mode = head, tail
+    if not path_part:
+        raise SandboxError(f"invalid volume {spec!r}: host path must not be empty")
+    if ":" in path_part:
+        raise SandboxError(
+            f"invalid volume {spec!r}: only ':ro' or ':rw' may follow the host path, "
+            "custom mountpoints are not permitted"
+        )
+
+    try:
+        resolved = Path(path_part).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise SandboxError(
+            f"volume path {path_part!r} does not exist on the host"
+        ) from exc
+
+    if resolved == Path("/"):
+        raise SandboxError("refusing to mount the root directory")
+    reject_forbidden_mount(resolved, "a volume")
+    if resolved in DOCKER_SOCKETS:
+        raise SandboxError(
+            f"refusing to mount {resolved}: the Docker socket grants host root access"
+        )
+    if not (resolved.is_dir() or resolved.is_file()):
+        raise SandboxError(
+            f"refusing to mount {resolved}: only regular files and directories are allowed"
+        )
+    return resolved, mode
+
+
+def add_timezone_mounts(plan: MountPlan) -> None:
+    # Only mount what exists, otherwise Docker creates directories on the host.
+    for name in ("/etc/localtime", "/etc/timezone"):
+        source = Path(name)
+        if source.exists():
+            plan.bind(source, name, "ro")
+
+
+def add_ssh_mounts(plan: MountPlan, specs: Sequence[str]) -> None:
+    ssh_dir = home_dir() / ".ssh"
+    wanted: list[str] = []
+    for spec in specs:
+        for name in spec.split(","):
+            name = name.strip()
+            if not name:
+                continue
+            if not _SSH_KEY_RE.match(name) or name in (".", ".."):
+                raise SandboxError(
+                    f"invalid SSH key name {name!r}: expected a plain file name inside ~/.ssh"
+                )
+            if name not in wanted:
+                wanted.append(name)
+    if not wanted:
+        if specs:
+            raise SandboxError("--ssh-key requires at least one key name")
+        return
+
+    files: list[str] = []
+    for name in wanted:
+        if not (ssh_dir / name).is_file():
+            raise SandboxError(f"SSH key {ssh_dir / name} does not exist")
+        files.append(name)
+        if (ssh_dir / f"{name}.pub").is_file():
+            files.append(f"{name}.pub")
+    for extra in ("config", "known_hosts"):
+        if (ssh_dir / extra).is_file() and extra not in files:
+            files.append(extra)
+
+    for name in files:
+        plan.bind(ssh_dir / name, f"{CONTAINER_HOME}/.ssh/{name}", "ro")
+
+
+def add_kubernetes_mount(plan: MountPlan) -> None:
+    config = home_dir() / ".kube" / "config"
+    if not config.is_file():
+        raise SandboxError(f"--kubernetes given, but {config} does not exist")
+    plan.bind(config, f"{CONTAINER_HOME}/.kube/config", "ro")
+    warn(
+        "~/.kube/config is mounted read-only; the container can use every "
+        "cluster credential in it"
+    )
+
+
+def add_blacklist_mounts(
+    plan: MountPlan, workspace: Path, workspace_dest: str, specs: Sequence[str]
+) -> None:
+    for spec in specs:
+        relative = spec.strip()
+        if not relative:
+            raise SandboxError("--blacklist requires a non-empty path")
+        if posixpath.isabs(relative):
+            raise SandboxError(
+                f"invalid blacklist path {spec!r}: expected a path relative to the workspace root"
+            )
+        normalised = posixpath.normpath(relative)
+        if normalised in (".", "..") or normalised.startswith("../"):
+            raise SandboxError(
+                f"invalid blacklist path {spec!r}: must stay inside the workspace"
+            )
+        if (workspace / normalised).is_symlink():
+            raise SandboxError(
+                f"invalid blacklist path {spec!r}: symlinks are not supported, "
+                "name the target directory instead"
+            )
+
+        try:
+            resolved = (workspace / normalised).resolve(strict=True)
+        except OSError as exc:
+            raise SandboxError(
+                f"blacklist path {spec!r} does not exist in the workspace"
+            ) from exc
+        if resolved == workspace or workspace not in resolved.parents:
+            raise SandboxError(
+                f"invalid blacklist path {spec!r}: resolves outside the workspace"
+            )
+        if not resolved.is_dir():
+            raise SandboxError(
+                f"invalid blacklist path {spec!r}: only directories can be hidden"
+            )
+        plan.tmpfs(f"{workspace_dest}/{normalised}", "ro,size=1m,mode=0555")
+
+
+def _has_entries(path: Path) -> bool:
+    try:
+        return any(path.iterdir())
+    except OSError:
+        return False
+
+
+def _group_id(name: str) -> int | None:
+    if grp is None:
+        return None
+    try:
+        return grp.getgrnam(name).gr_gid
+    except KeyError:
+        return None
+
+
+def add_voice_args(plan: MountPlan, uid: int) -> list[str]:
+    args: list[str] = []
+    runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{uid}")
+    audio_found = False
+
+    sound = Path("/dev/snd")
+    if sound.is_dir() and _has_entries(sound):
+        args += ["--device", "/dev/snd"]
+        audio_gid = _group_id("audio")
+        if audio_gid is not None:
+            args += ["--group-add", str(audio_gid)]
+        audio_found = True
+
+    pipewire = runtime_dir / "pipewire-0"
+    if pipewire.exists():
+        plan.bind(pipewire, f"/run/user/{uid}/pipewire-0", "rw")
+        audio_found = True
+
+    pulse = runtime_dir / "pulse"
+    if pulse.is_dir():
+        plan.bind(pulse, f"/run/user/{uid}/pulse", "rw")
+        args += ["-e", f"PULSE_SERVER=unix:/run/user/{uid}/pulse"]
+        audio_found = True
+
+    if audio_found:
+        args += ["-e", f"XDG_RUNTIME_DIR=/run/user/{uid}"]
+    else:
+        warn(
+            "--voice given, but no audio device (/dev/snd) or PipeWire/PulseAudio "
+            "socket was found on the host; voice mode may not work"
+        )
+    args += ["-e", "VIBE_VOICE_MODE_ENABLED=true"]
+    return args
+
+
+# --- container arguments --------------------------------------------------
+
+
+def add_env_args(specs: Sequence[str]) -> list[str]:
+    args: list[str] = []
+    for spec in specs:
+        name, separator, value = spec.partition("=")
+        if not _ENV_NAME_RE.match(name):
+            raise SandboxError(
+                f"invalid environment variable {spec!r}: expected KEY=VALUE or KEY"
+            )
+        if name in ("HOST_UID", "HOST_GID"):
+            warn(f"--env {name} overrides the user mapping the sandbox relies on")
+        if separator:
+            args += ["-e", f"{name}={value}"]
+            continue
+        forwarded = os.environ.get(name)
+        if forwarded is None:
+            warn(f"environment variable {name} is not set in this shell; not forwarding it")
+            continue
+        args += ["-e", f"{name}={forwarded}"]
+    return args
+
+
+def add_docker_args(specs: Sequence[str]) -> list[str]:
+    args: list[str] = []
+    weakened: set[str] = set()
+    for spec in specs:
+        try:
+            parts = shlex.split(spec)
+        except ValueError as exc:
+            raise SandboxError(f"invalid --docker-arg {spec!r}: {exc}") from exc
+        if not parts:
+            raise SandboxError("--docker-arg requires a non-empty value")
+        if parts[0] == "--":
+            raise SandboxError(
+                f"invalid --docker-arg {spec!r}: '--' would end the docker option list"
+            )
+        if not parts[0].startswith("-"):
+            raise SandboxError(
+                f"invalid --docker-arg {spec!r}: expected a 'docker run' flag, "
+                "not a positional argument"
+            )
+        args += parts
+        for part in parts:
+            flag = part.split("=", 1)[0]
+            if flag in ISOLATION_WEAKENING_FLAGS:
+                weakened.add(flag)
+    if weakened:
+        warn(
+            "--docker-arg weakens the sandbox isolation: "
+            + ", ".join(sorted(weakened))
+        )
+    return args
+
+
+def _random_suffix(length: int = 8) -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def resolve_workspace(raw: str | None) -> Path:
+    if raw is not None and not raw:
+        raise SandboxError("--workspace requires a non-empty path")
+    if raw is None:
+        try:
+            raw = os.getcwd()
+        except OSError as exc:
+            raise SandboxError(
+                f"could not determine the current working directory: {exc}"
+            ) from exc
+    workspace = resolve_directory(raw, "workspace")
+    reject_forbidden_mount(workspace, "the workspace")
+    return workspace
+
+
+def resolve_config_dir(raw: str | None) -> Path:
+    if raw is not None and not raw:
+        raise SandboxError("--config-dir requires a non-empty path")
+    path = Path(raw).expanduser() if raw else home_dir() / DEFAULT_CONFIG_DIRNAME
+    if not path.is_absolute():
+        path = Path.cwd() / path
+
+    created = False
+    if not path.exists():
+        try:
+            path.mkdir(parents=True, mode=0o700)
+        except OSError as exc:
+            raise SandboxError(
+                f"could not create configuration directory {path}: {exc}"
+            ) from exc
+        created = True
+
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise SandboxError(
+            f"configuration directory {path} is not accessible: {exc}"
+        ) from exc
+    if not resolved.is_dir():
+        raise SandboxError(f"configuration directory {path} is not a directory")
+    reject_forbidden_mount(resolved, "the configuration directory")
+
+    if created:
+        try:
+            resolved.chmod(0o700)
+        except OSError as exc:
+            raise SandboxError(
+                f"could not restrict permissions on {resolved}: {exc}"
+            ) from exc
+    else:
+        mode = resolved.stat().st_mode & 0o777
+        if mode & 0o077:
+            warn(
+                f"configuration directory {resolved} is accessible to other users "
+                f"(mode {mode:04o}); it holds API keys, consider 'chmod 700'"
+            )
+    return resolved
+
+
+# --- clipboard bridge -----------------------------------------------------
+#
+# vibe compiles clipboard image paste out on Linux (paste_image::is_supported is
+# cfg!(target_os = "macos")), so nothing in the container can read the host
+# clipboard on its own. Instead of mounting the display server in -- which on X11
+# would let anything in the container keylog and screenshot the desktop -- a stub
+# `vibe-paste` asks this process for one image over a unix socket. Only image
+# reads are served, and only while this session's terminal has seen recent input.
+
+VIBE_PASTE_SOURCE = r'''#!/usr/bin/env python3
+"""Copy the host clipboard image into the workspace and print its @ mention."""
+
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+MAX_BYTES = 10 * 1024 * 1024
+PREFERRED = (
+    ("image/png", ".png"),
+    ("image/jpeg", ".jpg"),
+    ("image/webp", ".webp"),
+    ("image/gif", ".gif"),
+)
+
+
+def ask(sock_path, target):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(10)
+        sock.connect(sock_path)
+        sock.sendall(target.encode() + b"\n")
+        sock.shutdown(socket.SHUT_WR)
+        reply = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            reply += chunk
+    status, _, payload = reply.partition(b"\n")
+    return status, payload
+
+
+def fail(status):
+    if status == b"BIG":
+        print(f"vibe-paste: clipboard image is larger than {MAX_BYTES} bytes",
+              file=sys.stderr)
+    else:
+        print("vibe-paste: no image on the clipboard", file=sys.stderr)
+    return 1
+
+
+def main():
+    sock_path = os.environ.get("VIBE_CLIPBOARD_SOCKET")
+    target_dir = os.environ.get("VIBE_PASTE_DIR")
+    if not sock_path or not target_dir:
+        print("vibe-paste: no clipboard bridge in this session", file=sys.stderr)
+        return 1
+    try:
+        status, payload = ask(sock_path, "TARGETS")
+    except OSError as exc:
+        print(f"vibe-paste: clipboard bridge unreachable: {exc}", file=sys.stderr)
+        return 1
+    if status != b"OK":
+        return fail(status)
+    available = payload.decode("utf-8", "replace").split()
+    chosen = next(((mime, ext) for mime, ext in PREFERRED if mime in available), None)
+    if chosen is None:
+        print("vibe-paste: no image on the clipboard", file=sys.stderr)
+        return 1
+    mime, extension = chosen
+    try:
+        status, data = ask(sock_path, mime)
+    except OSError as exc:
+        print(f"vibe-paste: clipboard bridge unreachable: {exc}", file=sys.stderr)
+        return 1
+    if status != b"OK":
+        return fail(status)
+    if not data:
+        print("vibe-paste: no image on the clipboard", file=sys.stderr)
+        return 1
+    if len(data) > MAX_BYTES:
+        print(f"vibe-paste: image is {len(data)} bytes, the limit is {MAX_BYTES}",
+              file=sys.stderr)
+        return 1
+    try:
+        directory = Path(target_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        path = directory / f"clipboard-{stamp}{extension}"
+        counter = 1
+        while path.exists():
+            path = directory / f"clipboard-{stamp}-{counter}{extension}"
+            counter += 1
+        path.write_bytes(data)
+    except OSError as exc:
+        print(f"vibe-paste: could not write the image: {exc}", file=sys.stderr)
+        return 1
+    try:
+        shown = path.relative_to(Path.cwd())
+    except ValueError:
+        shown = path
+    print(f"@{shown}")
+    return 0
+
+
+sys.exit(main())
+'''
+
+
+def _capture(command: list[str], limit: int) -> bytes | None:
+    """Run a host clipboard command, reading at most limit + 1 bytes of output."""
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+
+    chunks: list[bytes] = []
+    total = 0
+    deadline = time.monotonic() + CLIPBOARD_TOOL_TIMEOUT
+    try:
+        stream = process.stdout
+        if stream is None:
+            return None
+        while total <= limit:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([stream], [], [], remaining)
+            if not ready:
+                break
+            chunk = os.read(stream.fileno(), min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError:
+        pass
+    finally:
+        with contextlib.suppress(OSError):
+            process.kill()
+        with contextlib.suppress(subprocess.SubprocessError):
+            process.wait(timeout=CLIPBOARD_TOOL_TIMEOUT)
+
+    if total > limit:
+        # Truncated on purpose: the caller reports the oversize.
+        return b"".join(chunks)
+    if process.returncode != 0 or total == 0:
+        return None
+    return b"".join(chunks)
+
+
+def _detect_clipboard_tool() -> str | None:
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+        return "wl-paste"
+    if os.environ.get("DISPLAY") and shutil.which("xclip"):
+        return "xclip"
+    return None
+
+
+def _controlling_tty() -> str | None:
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            if stream is not None and stream.isatty():
+                return os.ttyname(stream.fileno())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+class ClipboardBridge:
+    """Serves host clipboard images to one sandbox over a unix socket."""
+
+    def __init__(self, tool: str, run_dir: Path, tty: str) -> None:
+        self._tool = tool
+        self._run_dir = run_dir
+        self._tty = tty
+        self._socket_path = run_dir / "clip.sock"
+        self._no_image_until = 0.0
+        self._closed = False
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+    @classmethod
+    def start(cls) -> ClipboardBridge | None:
+        """Start a bridge, or return None when this host cannot serve the clipboard."""
+        tool = _detect_clipboard_tool()
+        if tool is None:
+            if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY"):
+                warn(
+                    "install wl-clipboard (Wayland) or xclip (X11) on the host to "
+                    "paste images with vibe-paste"
+                )
+            return None
+        tty = _controlling_tty()
+        if tty is None:
+            return None
+        run_dir: Path | None = None
+        bridge: ClipboardBridge | None = None
+        try:
+            run_dir = Path(tempfile.mkdtemp(prefix="vibe-clipboard-"))
+            bridge = cls(tool, run_dir, tty)
+            bridge._listen()
+        except OSError as exc:
+            if bridge is not None:
+                bridge.close()
+            elif run_dir is not None:
+                shutil.rmtree(run_dir, ignore_errors=True)
+            warn(f"could not start the clipboard bridge: {exc}")
+            return None
+        return bridge
+
+    def _listen(self) -> None:
+        shim = self._run_dir / "vibe-paste"
+        shim.write_text(VIBE_PASTE_SOURCE, encoding="utf-8")
+        shim.chmod(0o755)
+        self._server.bind(str(self._socket_path))
+        self._socket_path.chmod(0o600)
+        self._server.listen(4)
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self) -> None:
+        while not self._closed:
+            try:
+                conn, _ = self._server.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    self._handle(conn)
+                except Exception:
+                    # One bad request must not cost the session its clipboard.
+                    continue
+
+    def _handle(self, conn: socket.socket) -> None:
+        conn.settimeout(CLIPBOARD_TOOL_TIMEOUT * 4)
+        request = b""
+        while b"\n" not in request and len(request) <= CLIPBOARD_MAX_REQUEST_BYTES:
+            chunk = conn.recv(CLIPBOARD_MAX_REQUEST_BYTES)
+            if not chunk:
+                break
+            request += chunk
+        if b"\n" not in request or len(request) > CLIPBOARD_MAX_REQUEST_BYTES:
+            conn.sendall(b"ERR\n")
+            return
+        target = request.split(b"\n")[0].decode("utf-8", "replace").strip()
+        status, payload = self._payload_for(target)
+        conn.sendall(status + b"\n" + payload)
+
+    def _payload_for(self, target: str) -> tuple[bytes, bytes]:
+        if not self._recently_used() or time.monotonic() < self._no_image_until:
+            return b"ERR", b""
+        status, payload = self._lookup(target)
+        if status != b"OK":
+            # Collapse the retry chain a paste triggers into one host round trip.
+            self._no_image_until = time.monotonic() + CLIPBOARD_EMPTY_CACHE_SECONDS
+        return status, payload
+
+    def _lookup(self, target: str) -> tuple[bytes, bytes]:
+        if target == CLIPBOARD_TARGETS:
+            images = [t for t in self._host_targets() if CLIPBOARD_IMAGE_MIME.fullmatch(t)]
+            if not images:
+                return b"ERR", b""
+            return b"OK", ("\n".join(images) + "\n").encode()
+        if not CLIPBOARD_IMAGE_MIME.fullmatch(target):
+            return b"ERR", b""
+        data = self._host_read(target)
+        if data is None:
+            return b"ERR", b""
+        if len(data) > CLIPBOARD_MAX_IMAGE_BYTES:
+            return b"BIG", b""
+        return b"OK", data
+
+    def _recently_used(self) -> bool:
+        try:
+            idle = time.time() - os.stat(self._tty).st_atime
+        except OSError:
+            return False
+        return idle <= CLIPBOARD_RECENT_INPUT_SECONDS
+
+    def _host_targets(self) -> list[str]:
+        if self._tool == "wl-paste":
+            out = _capture(["wl-paste", "--list-types"], CLIPBOARD_MAX_TARGETS_BYTES)
+        else:
+            out = _capture(
+                ["xclip", "-selection", "clipboard", "-t", CLIPBOARD_TARGETS, "-o"],
+                CLIPBOARD_MAX_TARGETS_BYTES,
+            )
+        return out.decode("utf-8", "replace").split() if out else []
+
+    def _host_read(self, mime: str) -> bytes | None:
+        if self._tool == "wl-paste":
+            return _capture(["wl-paste", "--type", mime], CLIPBOARD_MAX_IMAGE_BYTES)
+        return _capture(
+            ["xclip", "-selection", "clipboard", "-t", mime, "-o"],
+            CLIPBOARD_MAX_IMAGE_BYTES,
+        )
+
+    def docker_mounts(self) -> list[tuple[Path, str]]:
+        return [
+            (self._run_dir, CLIPBOARD_SOCKET_DIR),
+            (self._run_dir / "vibe-paste", CLIPBOARD_BIN),
+        ]
+
+    def docker_env(self, paste_dir: str) -> list[str]:
+        return [
+            f"VIBE_CLIPBOARD_SOCKET={CLIPBOARD_SOCKET}",
+            f"VIBE_PASTE_DIR={paste_dir}",
+        ]
+
+    def close(self) -> None:
+        self._closed = True
+        with contextlib.suppress(OSError):
+            self._server.close()
+        shutil.rmtree(self._run_dir, ignore_errors=True)
+
+
+def build_docker_command(
+    args: argparse.Namespace, bridge: ClipboardBridge | None = None
+) -> list[str]:
+    uid = os.getuid()
+    gid = os.getgid()
+
+    workspace = resolve_workspace(args.workspace)
+    workspace_dest = f"{CONTAINER_WORKSPACE}/{workspace.name}"
+    config_dir = resolve_config_dir(args.config_dir)
+
+    home = home_dir()
+    if is_sensitive_path(workspace):
+        warn(
+            f"workspace {workspace} is a sensitive host path; the container can "
+            "read and write it"
+        )
+    if config_dir == home or config_dir in home.parents:
+        warn(
+            f"configuration directory {config_dir} is your home directory or above; "
+            "it is mounted read-write as ~/.vibe"
+        )
+    if config_dir == workspace or workspace in config_dir.parents:
+        warn(
+            f"configuration directory {config_dir} is inside the workspace; "
+            "vibe state and API keys become part of the project"
+        )
+
+    plan = MountPlan()
+    plan.bind(workspace, workspace_dest, "rw")
+    plan.bind(config_dir, CONTAINER_VIBE_HOME, "rw")
+    add_timezone_mounts(plan)
+
+    for spec in args.volume:
+        source, mode = parse_volume(spec)
+        if source == config_dir or config_dir in source.parents:
+            raise SandboxError(
+                f"refusing to mount the configuration directory {config_dir} into the workspace"
+            )
+        if is_sensitive_path(source):
+            warn(f"mounting sensitive host path {source} into the container ({mode})")
+        plan.bind(source, f"{CONTAINER_WORKSPACE}/{source.name}", mode)
+
+    add_ssh_mounts(plan, args.ssh_key)
+    if args.kubernetes:
+        add_kubernetes_mount(plan)
+    add_blacklist_mounts(plan, workspace, workspace_dest, args.blacklist)
+
+    if bridge is not None:
+        for source, destination in bridge.docker_mounts():
+            plan.bind(source, destination, "ro")
+
+    voice_args = add_voice_args(plan, uid) if args.voice else []
+
+    command = [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        f"vibe-sandbox-{_random_suffix()}",
+        "--security-opt",
+        "no-new-privileges=true",
+        "--cpus",
+        validate_cpus(args.cpus),
+        "--memory",
+        validate_memory(args.memory),
+    ]
+    if not args.no_pull:
+        command += ["--pull", "always"]
+    command += ["-i"]
+    if sys.stdin.isatty():
+        command += ["-t"]
+    command += plan.args
+    command += voice_args
+    command += ["-e", f"HOST_UID={uid}", "-e", f"HOST_GID={gid}"]
+    command += add_env_args(args.env)
+    if args.model:
+        command += ["-e", f"VIBE_ACTIVE_MODEL={args.model}"]
+    if bridge is not None:
+        paste_dir = f"{CONTAINER_WORKSPACE}/{CLIPBOARD_PASTE_DIRNAME}"
+        for entry in bridge.docker_env(paste_dir):
+            command += ["-e", entry]
+
+    # Appended after the built-in flags so they take precedence.
+    command += add_docker_args(args.docker_arg)
+    if args.gpus:
+        command += ["--gpus=all"]
+
+    command += [IMAGE]
+
+    # Start at the mount root: the project sits at /workspace/<name> and pasted
+    # images at /workspace/vibe-pasted-images, so neither lands in the repository.
+    command += ["--workdir", CONTAINER_WORKSPACE]
+    if args.resume:
+        command += ["--continue"]
+    command += args.container_args
+    return command
+
+
+def _exit_status(code: int) -> int:
+    """Map a negative Popen return code (killed by signal N) to 128 + N."""
+    return 128 - code if code < 0 else code
+
+
+def run_docker(command: list[str], verbose: bool) -> int:
+    if verbose:
+        print(shlex.join(command), file=sys.stderr)
+    docker = shutil.which("docker")
+    if docker is None:
+        raise SandboxError("docker was not found in PATH")
+    command[0] = docker
+
+    # The clipboard bridge lives in this process, so docker runs as a child
+    # instead of replacing us.
+    try:
+        process = subprocess.Popen(command)
+    except OSError as exc:
+        raise SandboxError(f"could not execute docker: {exc}") from exc
+
+    def forward(_signum: int, _frame: object) -> None:
+        process.terminate()
+
+    previous = signal.signal(signal.SIGTERM, forward)
+    try:
+        return _exit_status(process.wait())
+    except KeyboardInterrupt:
+        process.terminate()
+        try:
+            return _exit_status(process.wait(timeout=15))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            return 130
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+# --- Ed25519 verification (RFC 8032) --------------------------------------
+#
+# Verification only: no secret material is handled here, and the inputs are
+# public, so constant-time behaviour is not required. Checked against the
+# RFC 8032 test vectors and against signatures produced by OpenSSL.
+
+_ED_P = 2**255 - 19
+_ED_L = 2**252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_SQRT_M1 = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_recover_x(y: int, sign: int) -> int | None:
+    if y >= _ED_P:
+        return None
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P) % _ED_P
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - x2) % _ED_P != 0:
+        x = x * _ED_SQRT_M1 % _ED_P
+    if (x * x - x2) % _ED_P != 0:
+        return None
+    if (x & 1) != sign:
+        x = _ED_P - x
+    return x
+
+
+def _ed_decode_point(data: bytes) -> tuple[int, int, int, int] | None:
+    if len(data) != 32:
+        return None
+    value = int.from_bytes(data, "little")
+    sign = value >> 255
+    y = value & ((1 << 255) - 1)
+    x = _ed_recover_x(y, sign)
+    if x is None:
+        return None
+    return (x, y, 1, x * y % _ED_P)
+
+
+def _ed_point_add(
+    p1: tuple[int, int, int, int], p2: tuple[int, int, int, int]
+) -> tuple[int, int, int, int]:
+    a = (p1[1] - p1[0]) * (p2[1] - p2[0]) % _ED_P
+    b = (p1[1] + p1[0]) * (p2[1] + p2[0]) % _ED_P
+    c = 2 * p1[3] * p2[3] * _ED_D % _ED_P
+    d = 2 * p1[2] * p2[2] % _ED_P
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % _ED_P, g * h % _ED_P, f * g % _ED_P, e * h % _ED_P)
+
+
+def _ed_scalar_mult(
+    scalar: int, point: tuple[int, int, int, int]
+) -> tuple[int, int, int, int]:
+    result = (0, 1, 1, 0)
+    while scalar:
+        if scalar & 1:
+            result = _ed_point_add(result, point)
+        point = _ed_point_add(point, point)
+        scalar >>= 1
+    return result
+
+
+def _ed_encode_point(point: tuple[int, int, int, int]) -> bytes:
+    z_inv = pow(point[2], _ED_P - 2, _ED_P)
+    x = point[0] * z_inv % _ED_P
+    y = point[1] * z_inv % _ED_P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+_ED_BASE_Y = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+_ED_BASE_X = _ed_recover_x(_ED_BASE_Y, 0)
+_ED_BASE = (_ED_BASE_X, _ED_BASE_Y, 1, _ED_BASE_X * _ED_BASE_Y % _ED_P)
+
+
+def _ed25519_verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
+    if len(public_key) != 32 or len(signature) != 64:
+        return False
+    point_a = _ed_decode_point(public_key)
+    point_r = _ed_decode_point(signature[:32])
+    if point_a is None or point_r is None:
+        return False
+    scalar_s = int.from_bytes(signature[32:], "little")
+    if scalar_s >= _ED_L:
+        return False
+    challenge = int.from_bytes(
+        hashlib.sha512(signature[:32] + public_key + message).digest(), "little"
+    ) % _ED_L
+    left = _ed_scalar_mult(scalar_s, _ED_BASE)
+    right = _ed_point_add(point_r, _ed_scalar_mult(challenge, point_a))
+    return _ed_encode_point(left) == _ed_encode_point(right)
+
+
+# --- upgrade --------------------------------------------------------------
+
+
+def _installed_script_path() -> Path:
+    location = globals().get("__file__")
+    if not location:
+        raise SandboxError("cannot upgrade when the script is not run from a file")
+    path = Path(os.path.realpath(location))
+    if not path.is_file():
+        raise SandboxError(f"cannot upgrade: {path} is not a regular file")
+    return path
+
+
+def _fetch(url: str, limit: int) -> bytes:
+    if not url.startswith("https://"):
+        raise SandboxError(f"refusing to download over a non-HTTPS URL: {url}")
+    request = urllib.request.Request(
+        url, headers={"User-Agent": f"vibe-sandbox/{SCRIPT_VERSION}"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            final_url = response.geturl()
+            if not final_url.startswith("https://"):
+                raise SandboxError(f"redirected to a non-HTTPS URL: {final_url}")
+            payload = response.read(limit + 1)
+    except (urllib.error.URLError, OSError) as exc:
+        raise SandboxError(f"could not download {url}: {exc}") from exc
+    if len(payload) > limit:
+        raise SandboxError(f"{url} exceeds {limit} bytes")
+    return payload
+
+
+def _decode_utf8(payload: bytes, what: str) -> str:
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SandboxError(f"{what} is not valid UTF-8") from exc
+
+
+def _parse_signature(text: str) -> bytes:
+    encoded = "".join(
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+    if not encoded:
+        raise SandboxError("signature file contains no signature")
+    try:
+        signature = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise SandboxError(f"malformed signature file: {exc}") from exc
+    if len(signature) != 64:
+        raise SandboxError(
+            f"malformed signature file: expected 64 bytes, got {len(signature)}"
+        )
+    return signature
+
+
+def _pinned_keys() -> list[bytes]:
+    keys: list[bytes] = []
+    for entry in RELEASE_KEYS:
+        try:
+            key = base64.b64decode(entry, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise SandboxError(f"invalid RELEASE_KEYS entry: {exc}") from exc
+        if len(key) != 32:
+            raise SandboxError("invalid RELEASE_KEYS entry: expected 32 bytes")
+        keys.append(key)
+    return keys
+
+
+def _verify_release(payload: bytes, signature: bytes) -> str:
+    """Return the fingerprint of the pinned key that signed payload."""
+    keys = _pinned_keys()
+    if not keys:
+        raise SandboxError(
+            "no release key is pinned in this script, refusing to upgrade; "
+            "add the maintainer's Ed25519 public key to RELEASE_KEYS"
+        )
+    for key in keys:
+        if _ed25519_verify(key, payload, signature):
+            return "SHA256:" + hashlib.sha256(key).hexdigest()
+    raise SandboxError(
+        "release signature does not match any pinned key, refusing to upgrade"
+    )
+
+
+def _extract_version(source: str) -> str | None:
+    match = _VERSION_RE.search(source)
+    return match.group(1) if match else None
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    parts = version.split(".")
+    if not parts or not all(part.isdigit() for part in parts):
+        raise SandboxError(f"unparsable version {version!r}")
+    return tuple(int(part) for part in parts)
+
+
+def _validate_python_script(source: str) -> None:
+    first_line = source.splitlines()[0] if source else ""
+    if not first_line.startswith("#!") or "python" not in first_line:
+        raise SandboxError("downloaded file is not a Python script, aborting update")
+    try:
+        compile(source, "<vibe-sandbox-update>", "exec")
+    except SyntaxError as exc:
+        raise SandboxError(f"downloaded file does not compile: {exc}") from exc
+
+
+def _install_script(script_path: Path, source: str) -> None:
+    directory = script_path.parent
+    if not os.access(directory, os.W_OK):
+        raise SandboxError(f"cannot write to {directory}; reinstall manually")
+
+    mode = script_path.stat().st_mode & 0o777
+    new_mode = mode if mode & 0o111 else 0o755
+
+    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=".vibe-sandbox-", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(source)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_path, new_mode)
+        os.replace(tmp_path, script_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def cmd_upgrade() -> int:
+    script_path = _installed_script_path()
+    print(f"Checking for updates (installed: v{SCRIPT_VERSION})...")
+
+    # Verify before parsing anything out of the payload.
+    payload = _fetch(SCRIPT_URL, MAX_SCRIPT_BYTES)
+    signature = _parse_signature(
+        _decode_utf8(_fetch(SIGNATURE_URL, MAX_SIGNATURE_BYTES), "signature file")
+    )
+    fingerprint = _verify_release(payload, signature)
+
+    source = _decode_utf8(payload, "downloaded file")
+    remote_version = _extract_version(source)
+    if remote_version is None:
+        raise SandboxError(f"downloaded file does not declare SCRIPT_VERSION: {SCRIPT_URL}")
+
+    remote = _version_tuple(remote_version)
+    current = _version_tuple(SCRIPT_VERSION)
+    if remote == current:
+        print(f"Already up to date (v{SCRIPT_VERSION}).")
+        return 0
+    if remote < current:
+        print(
+            f"Installed v{SCRIPT_VERSION} is newer than v{remote_version}; not downgrading."
+        )
+        return 0
+
+    _validate_python_script(source)
+    _install_script(script_path, source)
+    print(
+        f"Updated vibe-sandbox: v{SCRIPT_VERSION} -> v{remote_version} "
+        f"(signed by {fingerprint})"
+    )
+    return 0
+
+
+def cmd_verify(argv: Sequence[str]) -> int:
+    if len(argv) > 1:
+        raise SandboxError("verify takes at most one file argument")
+    target = Path(argv[0]).expanduser() if argv else _installed_script_path()
+    signature_path = target.with_name(target.name + ".sig")
+    if not target.is_file():
+        raise SandboxError(f"{target} is not a regular file")
+    if not signature_path.is_file():
+        raise SandboxError(f"signature file {signature_path} does not exist")
+
+    signature = _parse_signature(
+        _decode_utf8(signature_path.read_bytes(), f"signature file {signature_path}")
+    )
+    fingerprint = _verify_release(target.read_bytes(), signature)
+    print(f"{target}: signature valid ({fingerprint})")
+    return 0
+
+
+# --- command line ---------------------------------------------------------
+
+
+def _join_docker_args(argv: list[str]) -> list[str]:
+    """Rewrite '-D --flag' as '--docker-arg=--flag' so argparse accepts it."""
+    result: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if (
+            token in ("-D", "--docker-arg")
+            and index + 1 < len(argv)
+            and argv[index + 1].startswith("-")
+        ):
+            result.append(f"--docker-arg={argv[index + 1]}")
+            index += 2
+            continue
+        result.append(token)
+        index += 1
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    default_config_dir = home_dir() / DEFAULT_CONFIG_DIRNAME
+    parser = argparse.ArgumentParser(
+        prog="vibe-sandbox",
+        description="Run Mistral Vibe in a Docker sandbox.",
+        epilog=(
+            "Subcommands: 'upgrade' (alias 'update') installs a newer signed release, "
+            "'verify [FILE]' checks a local script against its .sig file.\n"
+            "Arguments that vibe-sandbox does not recognise are passed to vibe inside "
+            "the container, e.g. 'vibe-sandbox --agent ask'.\n"
+            "Use '--' to stop option parsing: 'vibe-sandbox -- --agent ask'."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-w",
+        "--workspace",
+        metavar="TEXT",
+        default=None,
+        help="Workspace directory (defaults to current directory)",
+    )
+    parser.add_argument(
+        "--no-pull",
+        action="store_true",
+        help="Don't pull latest image before running",
+    )
+    parser.add_argument(
+        "-m",
+        "--memory",
+        metavar="TEXT",
+        default=DEFAULT_MEMORY,
+        help=f"Memory limit, 8 being 8G (default: {DEFAULT_MEMORY})",
+    )
+    parser.add_argument(
+        "-c",
+        "--cpus",
+        metavar="TEXT",
+        default=DEFAULT_CPUS,
+        help=f"CPU limit (default: {DEFAULT_CPUS})",
+    )
+    parser.add_argument(
+        "--model",
+        metavar="TEXT",
+        default=None,
+        help="Name of the model to use (sets VIBE_ACTIVE_MODEL in the container)",
+    )
+    parser.add_argument(
+        "-v",
+        "--volume",
+        metavar="TEXT",
+        action="append",
+        default=[],
+        help=(
+            "Additional path to mount at /workspace/<name>, optionally suffixed with "
+            ":ro (default) or :rw; custom mountpoints are not permitted"
+        ),
+    )
+    parser.add_argument(
+        "--ssh-key",
+        metavar="TEXT",
+        action="append",
+        default=[],
+        help=(
+            "Name of a key in ~/.ssh to mount read-only, along with its .pub, "
+            "~/.ssh/config and ~/.ssh/known_hosts. Comma-separated for several. "
+            "E.g. --ssh-key id_ed25519"
+        ),
+    )
+    parser.add_argument(
+        "-r",
+        "--resume",
+        action="store_true",
+        help="Resume the most recent session",
+    )
+    parser.add_argument(
+        "-b",
+        "--blacklist",
+        metavar="TEXT",
+        action="append",
+        default=[],
+        help=(
+            "Directory to hide inside the container (relative to workspace root). "
+            "Mounts an empty tmpfs over the path. Can be specified multiple times."
+        ),
+    )
+    parser.add_argument(
+        "-k",
+        "--kubernetes",
+        "--kube",
+        dest="kubernetes",
+        action="store_true",
+        help="Mount ~/.kube/config inside the container (read-only) for Kubernetes access.",
+    )
+    parser.add_argument(
+        "-D",
+        "--docker-arg",
+        metavar="TEXT",
+        action="append",
+        default=[],
+        help=(
+            "Extra argument for 'docker run', e.g. --docker-arg=--gpus=all. "
+            "Shell-split, and appended after the built-in flags, so it overrides them. "
+            "Can be given multiple times."
+        ),
+    )
+    parser.add_argument(
+        "-e",
+        "--env",
+        metavar="TEXT",
+        action="append",
+        default=[],
+        help=(
+            "Extra environment variable for the container: KEY=VALUE, or KEY alone to "
+            "forward this shell's current value. Can be given multiple times."
+        ),
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print the full docker command before running it",
+    )
+    parser.add_argument(
+        "--config-dir",
+        metavar="TEXT",
+        default=None,
+        help=(
+            "Vibe configuration directory for this session, mounted as ~/.vibe "
+            f"(default: {default_config_dir})"
+        ),
+    )
+    parser.add_argument(
+        "--gpus",
+        action="store_true",
+        help="Shorthand for --docker-arg=--gpus=all",
+    )
+    parser.add_argument(
+        "--voice",
+        action="store_true",
+        help="Pass host audio devices into the container and enable vibe's voice mode",
+    )
+    parser.add_argument(
+        "--no-clipboard",
+        action="store_true",
+        help=(
+            "Don't expose the host clipboard to the container; disables the "
+            "vibe-paste command"
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {SCRIPT_VERSION}",
+    )
+    # Backwards-compatible aliases from the bash implementation.
+    parser.add_argument(
+        "--cpu", dest="cpus", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--mem", dest="memory", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    return parser
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = build_parser()
+    args, extra = parser.parse_known_args(_join_docker_args(list(argv)))
+    args.container_args = extra
+    return args
+
+
+def main(argv: Sequence[str]) -> int:
+    bridge: ClipboardBridge | None = None
+    try:
+        if argv and argv[0] in ("upgrade", "update"):
+            return cmd_upgrade()
+        if argv and argv[0] == "verify":
+            return cmd_verify(argv[1:])
+        args = parse_args(argv)
+        if os.geteuid() == 0:
+            raise SandboxError(
+                "refusing to run as root; run vibe-sandbox as a regular user instead"
+            )
+        if not args.no_clipboard:
+            bridge = ClipboardBridge.start()
+        return run_docker(build_docker_command(args, bridge), args.verbose)
+    except SandboxError as exc:
+        print(f"vibe-sandbox: error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if bridge is not None:
+            bridge.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
